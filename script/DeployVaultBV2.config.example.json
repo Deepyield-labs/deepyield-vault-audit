@@ -1,0 +1,36 @@
+{
+  "_comment": "Vault B MainV2 example only. Replace every zero role/treasury address. Deployment starts HALTED and cannot accept deposits until a separate admin enableOperations transaction. Amounts use BSC USDT 18-decimal base units.",
+  "admin": "0x0000000000000000000000000000000000000000",
+  "manager": "0x0000000000000000000000000000000000000000",
+  "keeper": "0x0000000000000000000000000000000000000000",
+  "guardian": "0x0000000000000000000000000000000000000000",
+  "projectTreasury": "0x0000000000000000000000000000000000000000",
+  "vaultTreasury": "0x0000000000000000000000000000000000000000",
+
+  "partnerShareBps": 0,
+  "vaultDepositCap": 500000000000000000000,
+  "vaultName": "DeepYield Vault B V2 USDT",
+  "vaultSymbol": "dyBV2-USDT",
+  "performanceFeeBps": 2000,
+
+  "normalSwapLossBps": 100,
+  "maxEmergencySwapLossBps": 1000,
+  "maxOracleDeviationBps": 500,
+  "mintLossBps": 100,
+  "normalCloseLossBps": 100,
+  "emergencyCloseLossBps": 1000,
+  "twapWindow": 1800,
+  "maxBnbFeedAge": 3600,
+  "maxUsdtFeedAge": 90000,
+  "maxEmergencyDuration": 600,
+  "maxSwapDeadlineDelay": 120,
+
+  "maxNormalCakeNotional": 5100000000000000000000,
+  "maxEmergencyCakeNotional": 50000000000000000000000,
+  "hardMaxActiveAssets": 50000000000000000000000,
+  "hardMaxSwapPerJob": 50000000000000000000000,
+  "hardDailySwapLimit": 100000000000000000000000,
+  "initialCanaryOpenCap": 500000000000000000000,
+  "initialSwapPerJobCap": 1000000000000000000000,
+  "initialDailySwapLimit": 2000000000000000000000
+}
