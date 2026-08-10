@@ -22,3 +22,5 @@ upstream-audited and out of scope):
 | VaultBCakePriceGuard | 238 | 867 |
 | BoundedPancakeExecutionAdapterV2 | 145 | 681 |
 | BoundedPancakeRewardAdapterV2 | 114 | 650 |
+| PartnerRegistry | 282 | 1099 |
+| PartnerAttributedSplitter | 243 | 2210 |
