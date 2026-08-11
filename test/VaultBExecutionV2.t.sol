@@ -47,6 +47,26 @@ contract MockVaultBFeed is IChainlinkAggregatorV3 {
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
         return (roundId, answer, updatedAt, updatedAt, answeredInRound);
     }
+
+    int192 public boundMin = 1;
+    int192 public boundMax = type(int192).max;
+
+    function setBounds(int192 mn, int192 mx) external {
+        boundMin = mn;
+        boundMax = mx;
+    }
+
+    function aggregator() external view returns (address) {
+        return address(this);
+    }
+
+    function minAnswer() external view returns (int192) {
+        return boundMin;
+    }
+
+    function maxAnswer() external view returns (int192) {
+        return boundMax;
+    }
 }
 
 contract MockCanonicalVaultBPool is IPancakeV3Pool {
@@ -211,6 +231,7 @@ contract VaultBExecutionV2Test is Test {
             normalLossBps_: 100,
             maxEmergencyLossBps_: 1_000,
             maxOracleDeviationBps_: 500,
+            maxEmergencyOracleDeviationBps_: 1_000,
             twapWindow_: 1_800,
             maxBnbFeedAge_: 3_600,
             maxUsdtFeedAge_: 90_000,
@@ -281,6 +302,58 @@ contract VaultBExecutionV2Test is Test {
         _setHealthyFeeds(1e8, 1e8);
         vm.expectRevert(VaultBPriceGuard.EmergencyBudgetInactive.selector);
         guard.minimumOut(USDT, WBNB, 1e18, true);
+    }
+
+    // ── B5-T1 ────────────────────────────────────────────────────────────────
+
+    // A Chainlink-vs-TWAP gap wider than the normal ceiling but within the
+    // emergency ceiling: normal quote reverts, emergency quote (with an active
+    // budget) passes. This is the emergency exit the old code killed.
+    function test_EmergencyDeviationWiderThanNormalPasses() public {
+        _setHealthyFeeds(1e8, 107e6); // chainlink 1.07x twap -> ~700 bps > normal 500, < emergency 1000
+        pool.setTwapTick(0);
+
+        vm.expectPartialRevert(VaultBPriceGuard.OracleDeviation.selector);
+        guard.quote(USDT, WBNB, 1e18, false);
+
+        vm.prank(guardian);
+        guard.activateEmergencyBudget(1_000, uint64(block.timestamp + 300));
+        VaultBPriceGuard.Quote memory q = guard.quote(USDT, WBNB, 1e18, true);
+        assertGt(q.minOut, 0, "emergency exit quotes through the wider deviation band");
+        assertGt(q.deviationBps, 500);
+    }
+
+    function test_DeviationAboveEmergencyCeilingStillReverts() public {
+        _setHealthyFeeds(1e8, 112e6); // ~1200 bps > emergency 1000
+        pool.setTwapTick(0);
+        vm.prank(guardian);
+        guard.activateEmergencyBudget(1_000, uint64(block.timestamp + 300));
+        vm.expectPartialRevert(VaultBPriceGuard.OracleDeviation.selector);
+        guard.quote(USDT, WBNB, 1e18, true);
+    }
+
+    function test_FeedPinnedAtAggregatorBoundReverts() public {
+        _setHealthyFeeds(1e8, 1e8);
+        pool.setTwapTick(0);
+        bnbFeed.setBounds(1e8, 1e12); // answer 1e8 sits exactly on minAnswer
+        vm.expectPartialRevert(VaultBPriceGuard.OracleAtBound.selector);
+        guard.quote(USDT, WBNB, 1e18, false);
+    }
+
+    function test_ConfigRejectsAbsurdNormalLoss() public {
+        vm.expectRevert(VaultBPriceGuard.InvalidConfiguration.selector);
+        new VaultBPriceGuard({
+            normalLossBps_: 2_000, // > HARD_MAX_LOSS_BPS 1000
+            maxEmergencyLossBps_: 2_000,
+            maxOracleDeviationBps_: 500,
+            maxEmergencyOracleDeviationBps_: 1_000,
+            twapWindow_: 1_800,
+            maxBnbFeedAge_: 3_600,
+            maxUsdtFeedAge_: 90_000,
+            maxEmergencyDuration_: 600,
+            admin_: admin,
+            guardian_: guardian
+        });
     }
 
     function testEmergencyBudgetRejectsOutsiderAndOverCap() public {

@@ -88,6 +88,15 @@ contract MockNfpm is INfpmVenue {
 contract MockPool is IV3PoolVenue {
     uint160 public sp;
     int24 public tk;
+    address public token0;
+    address public token1;
+    uint24 public fee;
+
+    constructor(address token0_, address token1_, uint24 fee_) {
+        token0 = token0_;
+        token1 = token1_;
+        fee = fee_;
+    }
 
     function set(uint160 s, int24 t) external {
         sp = s;
@@ -125,6 +134,10 @@ contract MockMasterchef is IMasterchefVenue {
     function collect(IMasterchefVenue.CollectParams calldata) external pure returns (uint256, uint256) {
         return (0, 0); // no LP fees accrued in the mock
     }
+
+    function v3PoolAddressPid(address) external pure returns (uint256) {
+        return 1; // any nonzero pid: this masterchef "knows" the pool
+    }
 }
 
 contract PancakeV3MasterchefVenueTest is Test {
@@ -142,7 +155,7 @@ contract PancakeV3MasterchefVenueTest is Test {
         usdt = new MockUSDT();
         wbnb = new MockUSDT();
         nfpm = new MockNfpm(IERC20(address(usdt)), IERC20(address(wbnb)));
-        pool = new MockPool();
+        pool = new MockPool(address(usdt), address(wbnb), 100);
         // not farmed (masterchef=0) for the unit path; farmed path is wiring-only
         venue = new PancakeV3MasterchefVenue(
             controller,

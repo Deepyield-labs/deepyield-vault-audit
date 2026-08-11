@@ -37,6 +37,13 @@ contract MockMainV2PriceGuard is IVaultBPriceGuard, IVaultBRewardPriceGuard {
         emergencyActive = value;
     }
 
+    // Test hook (default values preserved): widen/narrow the guard's own swap
+    // budget so a test can make it diverge from Main's static close budget.
+    function setLossBps(uint16 normal_, uint16 emergency_) external {
+        normalLossBps = normal_;
+        emergencyLossBps = emergency_;
+    }
+
     function minimumOut(address, address, uint256 amountIn, bool emergency) external view returns (uint256) {
         require(!fail, "guard unavailable");
         require(!emergency || emergencyActive, "emergency inactive");
@@ -78,6 +85,14 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
     IVaultBRewardPriceGuard public guard;
     uint256 public lastEffectiveMinOut;
     bool public lastEmergency;
+    // Same test hook as MockMainV2ExecutionAdapter (default off).
+    uint256 public forcedOut;
+    bool public forcedOutSet;
+
+    function setForcedOut(uint256 v) external {
+        forcedOut = v;
+        forcedOutSet = true;
+    }
 
     constructor(address binder_, IVaultBRewardPriceGuard guard_) {
         binder = binder_;
@@ -98,12 +113,18 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
         returns (uint256 amountOut)
     {
         require(msg.sender == main, "main");
-        uint256 guardMin = guard.minimumOut(amountIn, emergency);
-        lastEffectiveMinOut = keeperMinOut > guardMin ? keeperMinOut : guardMin;
         lastEmergency = emergency;
         IERC20(rewardToken).safeTransferFrom(main, address(this), amountIn);
-        amountOut = amountIn;
-        require(amountOut >= lastEffectiveMinOut, "slippage");
+        if (forcedOutSet) {
+            amountOut = forcedOut;
+            lastEffectiveMinOut = keeperMinOut;
+            require(amountOut >= keeperMinOut, "slippage");
+        } else {
+            uint256 guardMin = guard.minimumOut(amountIn, emergency);
+            lastEffectiveMinOut = keeperMinOut > guardMin ? keeperMinOut : guardMin;
+            amountOut = amountIn;
+            require(amountOut >= lastEffectiveMinOut, "slippage");
+        }
         IERC20(asset).safeTransfer(main, amountOut);
     }
 }
@@ -119,6 +140,17 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
         IVaultBPriceGuard public guard;
         uint256 public lastEffectiveMinOut;
         bool public lastEmergency;
+        // Test hook: when set, the adapter returns exactly `forcedOut` and its
+        // only floor is `keeperMinOut` (0 allowed) — modelling the real adapter
+        // whose sole output floor is the calldata min. Default off preserves the
+        // existing 1:1 behaviour for all pre-existing tests.
+        uint256 public forcedOut;
+        bool public forcedOutSet;
+
+        function setForcedOut(uint256 v) external {
+            forcedOut = v;
+            forcedOutSet = true;
+        }
 
         constructor(address binder_, IVaultBPriceGuard guard_) {
             binder = binder_;
@@ -153,12 +185,18 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
             returns (uint256 amountOut)
         {
             require(msg.sender == main, "main");
-            uint256 guardMin = guard.minimumOut(tokenIn, tokenOut, amountIn, emergency);
-            lastEffectiveMinOut = keeperMinOut > guardMin ? keeperMinOut : guardMin;
             lastEmergency = emergency;
             IERC20(tokenIn).safeTransferFrom(main, address(this), amountIn);
-            amountOut = amountIn;
-            require(amountOut >= lastEffectiveMinOut, "slippage");
+            if (forcedOutSet) {
+                amountOut = forcedOut;
+                lastEffectiveMinOut = keeperMinOut;
+                require(amountOut >= keeperMinOut, "slippage");
+            } else {
+                uint256 guardMin = guard.minimumOut(tokenIn, tokenOut, amountIn, emergency);
+                lastEffectiveMinOut = keeperMinOut > guardMin ? keeperMinOut : guardMin;
+                amountOut = amountIn;
+                require(amountOut >= lastEffectiveMinOut, "slippage");
+            }
             IERC20(tokenOut).safeTransfer(main, amountOut);
         }
     }
@@ -345,6 +383,7 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
             executor.bindMain(address(main));
             rewardExecutor.bindMain(address(main));
             venue.bindController(address(main));
+            _mockSpotAtOracle();
 
             usdt.mint(address(this), 100_000e18);
             usdt.mint(address(executor), 100_000e18);
@@ -359,6 +398,16 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
         function _etchToken(address target) internal {
             MockMainV2Token template = new MockMainV2Token();
             vm.etch(target, address(template).code);
+        }
+
+        // Make the pool spot price equal the (mock) oracle price 1, so the
+        // spot-vs-oracle close gate passes in the deterministic unit harness.
+        function _mockSpotAtOracle() internal {
+            vm.mockCall(
+                0x172fcD41E0913e95784454622d1c3724f546f849,
+                abi.encodeWithSignature("slot0()"),
+                abi.encode(uint160(0x1000000000000000000000000), int24(0), uint16(0), uint16(0), uint16(0), uint32(0), true)
+            );
         }
 
         function _fund(uint256 amount) internal {
@@ -549,16 +598,20 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
             assertEq(executor.lastEffectiveMinOut(), 990e18);
         }
 
-        function testCloseRejectsAggregateValueLossAndRestoresPosition() public {
+        // B1-T5: with the one-basis floor the per-leg LP minimum (amount0Min from
+        // the spot composition) is the active execution-slippage guard and reverts
+        // a 10%-short close; the aggregate CloseValueBelowFloor is now a redundant
+        // Main-side backstop against a venue under-delivering below that. Spot
+        // manipulation is caught earlier by the spot-vs-oracle gate (see
+        // VaultBMainV2CloseFloorBasis.t.sol). (Rewritten; named in B1-T5.)
+        function testCloseRejectsExecutionShortfallAndRestoresPosition() public {
             _fund(2_000e18);
             uint256 id = _open(keccak256("open-loss"));
-            // A manipulated spot preview would accept 900 (min 891), while the
-            // independently TWAP-valued geometry still says the LP is worth 1000.
-            venue.configureClose(900e18, 0, 1_000e18, 0, 900e18, 0);
+            venue.configureClose(1_000e18, 0, 1_000e18, 0, 900e18, 0); // 10% execution shortfall
             _mintCloseInventory(900e18, 0);
 
             vm.prank(keeper);
-            vm.expectPartialRevert(DedicatedVaultMainV2.CloseValueBelowFloor.selector);
+            vm.expectRevert(bytes("close min"));
             main.closeToInventory(keccak256("close-loss"), block.timestamp + 60, false);
             assertEq(main.activePositionId(), id, "revert restores Main state");
             assertEq(venue.activeId(), id, "revert restores venue state");
@@ -585,11 +638,15 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
             main.liquidateAllWbnb(sellJob, 0, 1, block.timestamp + 60, true, false);
         }
 
-        function testTemporalSlicingIsExplicitlyDisabled() public {
+        // B1-T1 enables the previously-disabled chunk mechanism to let an
+        // oversized residual be drained over several bounded calls. This test
+        // locked the intentionally-disabled behavior and is updated to assert
+        // that a bounded non-final chunk now proceeds. (Named in the B1-T1 report.)
+        function testBoundedChunkingIsEnabled() public {
             wbnb.mint(address(main), 10e18);
             vm.prank(keeper);
-            vm.expectRevert(DedicatedVaultMainV2.SlicingDisabled.selector);
             main.liquidateAllWbnb(keccak256("slice"), 1, 1, block.timestamp + 60, false, false);
+            assertEq(wbnb.balanceOf(address(main)), 0);
         }
 
         function testNormalSwapCapsDoNotBlockBoundedGuardianExit() public {
@@ -791,7 +848,7 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
             assertEq(uint256(status), uint256(DedicatedVaultMainV2.JobStatus.COMPLETED));
         }
 
-        function testDuplicateRewardJobAndTemporalSlicingAreRejected() public {
+        function testDuplicateRewardJobRejectedAndChunkingEnabled() public {
             cake.mint(address(main), 100e18);
             bytes32 jobId = keccak256("sell-cake-dupe");
             vm.prank(keeper);
@@ -802,9 +859,11 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
             vm.expectRevert(DedicatedVaultMainV2.JobAlreadyCompleted.selector);
             main.liquidateAllReward(jobId, 0, 1, block.timestamp + 60, true, false);
 
+            // B1-T1 enables chunking; a bounded non-final chunk now proceeds
+            // instead of reverting SlicingDisabled. (Named in the B1-T1 report.)
             vm.prank(keeper);
-            vm.expectRevert(DedicatedVaultMainV2.SlicingDisabled.selector);
             main.liquidateAllReward(keccak256("sell-cake-slice"), 1, 1, block.timestamp + 60, false, false);
+            assertEq(cake.balanceOf(address(main)), 0);
         }
 
         function testNormalRewardCapCannotBlockBoundedGuardianLiquidation() public {
@@ -846,13 +905,17 @@ contract MockMainV2RewardAdapter is IVaultBRewardExecutionAdapterV2 {
             assertEq(main.totalAssetsUsdt(), 1_009.9e18);
         }
 
-        function testActiveLpNavUsesTwapGeometryAndExecutableWbnbFloor() public {
+        // B1-T5: NAV values the active position at the LOWER of its TWAP and spot
+        // geometry (each at the oracle floor), so a spot push cannot inflate the
+        // ERC-4626 share price. Here the spot leg is inflated to 800 USDT but NAV
+        // takes the 600-USDT TWAP leg. (Rewritten; named in B1-T5.)
+        function testActiveLpNavUsesLowerOfTwapAndSpotGeometry() public {
             _fund(2_000e18);
             _open(keccak256("open-nav"));
-            venue.configureClose(0, 0, 600e18, 400e18, 0, 0);
+            venue.configureClose(800e18, 400e18, 600e18, 400e18, 0, 0);
 
-            // 1,000 idle + 600 USDT leg + 400 WBNB valued at the normal
-            // executable 99% floor. Uncollected fees are deliberately excluded.
+            // 1,000 idle + min(spot 800 + 400*99%, twap 600 + 400*99%)
+            //           = 1,000 + min(1,196, 996) = 1,996.
             assertEq(main.totalAssetsUsdt(), 1_996e18);
         }
 

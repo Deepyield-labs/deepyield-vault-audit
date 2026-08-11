@@ -64,29 +64,35 @@ library FullMath {
             prod0 := sub(prod0, remainder)
         }
 
-        uint256 twos = (~denominator + 1) & denominator;
-        assembly {
-            denominator := div(denominator, twos)
-        }
+        // The 512-bit path relies on wrapping (mod 2**256) arithmetic that is
+        // canonical under pre-0.8 Solidity; under ^0.8 it must be `unchecked`, or
+        // the intended overflows revert. The two require()s above stay outside as
+        // real reverts (they must not be silenced).
+        unchecked {
+            uint256 twos = (~denominator + 1) & denominator;
+            assembly {
+                denominator := div(denominator, twos)
+            }
 
-        assembly {
-            prod0 := div(prod0, twos)
-        }
-        assembly {
-            twos := add(div(sub(0, twos), twos), 1)
-        }
-        prod0 |= prod1 * twos;
+            assembly {
+                prod0 := div(prod0, twos)
+            }
+            assembly {
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+            prod0 |= prod1 * twos;
 
-        uint256 inv = (3 * denominator) ^ 2;
-        inv *= 2 - denominator * inv; // inverse mod 2**8
-        inv *= 2 - denominator * inv; // inverse mod 2**16
-        inv *= 2 - denominator * inv; // inverse mod 2**32
-        inv *= 2 - denominator * inv; // inverse mod 2**64
-        inv *= 2 - denominator * inv; // inverse mod 2**128
-        inv *= 2 - denominator * inv; // inverse mod 2**256
+            uint256 inv = (3 * denominator) ^ 2;
+            inv *= 2 - denominator * inv; // inverse mod 2**8
+            inv *= 2 - denominator * inv; // inverse mod 2**16
+            inv *= 2 - denominator * inv; // inverse mod 2**32
+            inv *= 2 - denominator * inv; // inverse mod 2**64
+            inv *= 2 - denominator * inv; // inverse mod 2**128
+            inv *= 2 - denominator * inv; // inverse mod 2**256
 
-        result = prod0 * inv;
-        return result;
+            result = prod0 * inv;
+            return result;
+        }
     }
 
     function mulDivRoundingUp(
@@ -637,6 +643,15 @@ abstract contract AccessControl is Context, IAccessControl, ERC165 {
 
 // src/VaultBPriceGuard.sol
 
+/// @dev Circuit-breaker bounds of a Chainlink OCR feed. Standard BSC feeds are
+/// EACAggregatorProxy -> AccessControlledOffchainAggregator, which exposes these;
+/// read defensively so a proxy that does not is simply not bound-checked.
+interface IChainlinkBounds {
+    function aggregator() external view returns (address);
+    function minAnswer() external view returns (int192);
+    function maxAnswer() external view returns (int192);
+}
+
 /// @notice On-chain lower bound for Vault B's canonical USDT/WBNB swaps.
 /// Keeper-supplied minima can only make execution stricter; they can never
 /// relax this Chainlink + Pancake TWAP floor.
@@ -645,6 +660,12 @@ contract VaultBPriceGuard is AccessControl, IVaultBPriceGuard {
 
     uint256 internal constant BPS = 10_000;
     uint24 public constant POOL_FEE = 100;
+
+    /// @notice Economic ceilings on configuration, mirroring Main's HARD_MAX_*:
+    /// 10% is already an extreme loss/deviation for a WBNB/USDT swap, so anything
+    /// above it is a misconfiguration (e.g. a param from the wrong category).
+    uint16 public constant HARD_MAX_LOSS_BPS = 1_000; // 10%
+    uint16 public constant HARD_MAX_DEVIATION_BPS = 1_000; // 10%
 
     address public constant USDT = 0x55d398326f99059fF775485246999027B3197955;
     address public constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
@@ -659,6 +680,11 @@ contract VaultBPriceGuard is AccessControl, IVaultBPriceGuard {
     uint16 public immutable normalLossBps;
     uint16 public immutable maxEmergencyLossBps;
     uint16 public immutable maxOracleDeviationBps;
+    /// @notice Wider Chainlink-vs-TWAP deviation tolerated ONLY in emergency, so a
+    /// real market gap (TWAP lagging while the oracle has moved) does not kill the
+    /// emergency exit. It is also the hard ceiling: beyond it even an emergency
+    /// refuses to quote, rather than swapping against a fully broken oracle.
+    uint16 public immutable maxEmergencyOracleDeviationBps;
     uint32 public immutable twapWindow;
     uint32 public immutable maxBnbFeedAge;
     uint32 public immutable maxUsdtFeedAge;
@@ -679,6 +705,7 @@ contract VaultBPriceGuard is AccessControl, IVaultBPriceGuard {
     error IncompleteOracleRound(address feed, uint80 roundId, uint80 answeredInRound);
     error UnsupportedOracleDecimals(address feed, uint8 decimals);
     error OracleDeviation(uint256 chainlinkOut, uint256 twapOut, uint256 deviationBps);
+    error OracleAtBound(address feed, int256 answer, int192 minAnswer, int192 maxAnswer);
     error TwapUnavailable();
     error EmergencyBudgetInactive();
     error InvalidEmergencyBudget();
@@ -699,6 +726,7 @@ contract VaultBPriceGuard is AccessControl, IVaultBPriceGuard {
         uint16 normalLossBps_,
         uint16 maxEmergencyLossBps_,
         uint16 maxOracleDeviationBps_,
+        uint16 maxEmergencyOracleDeviationBps_,
         uint32 twapWindow_,
         uint32 maxBnbFeedAge_,
         uint32 maxUsdtFeedAge_,
@@ -709,9 +737,12 @@ contract VaultBPriceGuard is AccessControl, IVaultBPriceGuard {
         if (block.chainid != 56) revert WrongChain(block.chainid);
         if (admin_ == address(0) || guardian_ == address(0)) revert ZeroAddress();
         if (
-            normalLossBps_ == 0 || normalLossBps_ >= BPS || maxEmergencyLossBps_ < normalLossBps_
-                || maxEmergencyLossBps_ >= BPS || maxOracleDeviationBps_ == 0 || maxOracleDeviationBps_ >= BPS
-                || twapWindow_ < 60 || maxBnbFeedAge_ == 0 || maxUsdtFeedAge_ == 0 || maxEmergencyDuration_ == 0
+            normalLossBps_ == 0 || normalLossBps_ > HARD_MAX_LOSS_BPS || maxEmergencyLossBps_ < normalLossBps_
+                || maxEmergencyLossBps_ > HARD_MAX_LOSS_BPS || maxOracleDeviationBps_ == 0
+                || maxOracleDeviationBps_ > HARD_MAX_DEVIATION_BPS
+                || maxEmergencyOracleDeviationBps_ < maxOracleDeviationBps_
+                || maxEmergencyOracleDeviationBps_ > HARD_MAX_DEVIATION_BPS || twapWindow_ < 60 || maxBnbFeedAge_ == 0
+                || maxUsdtFeedAge_ == 0 || maxEmergencyDuration_ == 0
         ) revert InvalidConfiguration();
 
         address token0 = pool.token0();
@@ -721,6 +752,7 @@ contract VaultBPriceGuard is AccessControl, IVaultBPriceGuard {
         normalLossBps = normalLossBps_;
         maxEmergencyLossBps = maxEmergencyLossBps_;
         maxOracleDeviationBps = maxOracleDeviationBps_;
+        maxEmergencyOracleDeviationBps = maxEmergencyOracleDeviationBps_;
         twapWindow = twapWindow_;
         maxBnbFeedAge = maxBnbFeedAge_;
         maxUsdtFeedAge = maxUsdtFeedAge_;
@@ -777,7 +809,15 @@ contract VaultBPriceGuard is AccessControl, IVaultBPriceGuard {
         uint256 lower = q.chainlinkOut < q.twapOut ? q.chainlinkOut : q.twapOut;
         uint256 upper = q.chainlinkOut > q.twapOut ? q.chainlinkOut : q.twapOut;
         q.deviationBps = FullMath.mulDiv(upper - lower, BPS, lower);
-        if (q.deviationBps > maxOracleDeviationBps) {
+        // The deviation ceiling is mode-dependent: emergencies tolerate a wider
+        // Chainlink-vs-TWAP gap (a real market move the TWAP has not caught up to)
+        // so the emergency exit is not killed by the very condition it exists for.
+        // The normal ceiling is NOT relaxed. The wider band still binds, so a fully
+        // broken oracle is refused even in emergency. `_lossBudget` below still
+        // requires an active guardian budget, so the wider band is unreachable
+        // without one.
+        uint256 deviationLimit = emergency ? maxEmergencyOracleDeviationBps : maxOracleDeviationBps;
+        if (q.deviationBps > deviationLimit) {
             revert OracleDeviation(q.chainlinkOut, q.twapOut, q.deviationBps);
         }
 
@@ -818,6 +858,8 @@ contract VaultBPriceGuard is AccessControl, IVaultBPriceGuard {
         uint256 age = block.timestamp - updatedAt;
         if (age > maxAge) revert StaleOracle(address(feed), age);
 
+        _checkAggregatorBounds(feed, answer);
+
         uint8 decimals = feed.decimals();
         if (decimals > 36) revert UnsupportedOracleDecimals(address(feed), decimals);
         // `answer > 0` above proves this signed-to-unsigned cast preserves the value.
@@ -826,6 +868,24 @@ contract VaultBPriceGuard is AccessControl, IVaultBPriceGuard {
         if (decimals == 18) return unsigned;
         if (decimals < 18) return unsigned * (10 ** (18 - decimals));
         return unsigned / (10 ** (decimals - 18));
+    }
+
+    /// @notice Reject an answer pinned to the aggregator's min/maxAnswer circuit
+    /// breaker — a crashed feed clamps to the bound and otherwise looks fresh,
+    /// positive and complete. Bounds are read defensively: a proxy that does not
+    /// expose them is simply not bound-checked (see report — a configurable
+    /// corridor is the backstop if any of our feeds ever lacked them; the BSC
+    /// OCR feeds we use do expose them).
+    function _checkAggregatorBounds(IChainlinkAggregatorV3 feed, int256 answer) internal view {
+        try IChainlinkBounds(address(feed)).aggregator() returns (address agg) {
+            try IChainlinkBounds(agg).minAnswer() returns (int192 mn) {
+                try IChainlinkBounds(agg).maxAnswer() returns (int192 mx) {
+                    if (mx > mn && (answer <= int256(mn) || answer >= int256(mx))) {
+                        revert OracleAtBound(address(feed), answer, mn, mx);
+                    }
+                } catch {}
+            } catch {}
+        } catch {}
     }
 
     function _twapQuote(address tokenIn, address tokenOut, uint256 amountIn) internal view returns (uint256) {

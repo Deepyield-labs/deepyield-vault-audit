@@ -70,10 +70,10 @@ contract VaultBAsyncRedeemV2ForkTest is Test {
         vault = new DeepYieldVaultB(
             IERC20(USDT), "DeepYield Vault B V2", "dyBV2", admin, guardian, feeRecipient, 50_000e18
         );
-        guard = new VaultBPriceGuard(100, 1_000, 500, 1_800, 3_600, 90_000, 600, admin, guardian);
+        guard = new VaultBPriceGuard(100, 1_000, 500, 1_000, 1_800, 3_600, 90_000, 600, admin, guardian);
         executor = new BoundedPancakeExecutionAdapterV2(address(this), IVaultBPriceGuard(address(guard)), 120);
         rewardGuard =
-            new VaultBCakePriceGuard(100, 1_000, 500, 5_100e18, 50_000e18, 1_800, 3_600, 90_000, 600, admin, guardian);
+            new VaultBCakePriceGuard(100, 1_000, 500, 1_000, 5_100e18, 50_000e18, 1_800, 3_600, 90_000, 600, admin, guardian);
         rewardExecutor =
             new BoundedPancakeRewardAdapterV2(address(this), IVaultBRewardPriceGuard(address(rewardGuard)), 120);
 

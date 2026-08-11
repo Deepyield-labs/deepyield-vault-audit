@@ -47,6 +47,26 @@ contract MockCakeFeed is IChainlinkAggregatorV3 {
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
         return (roundId, answer, updatedAt, updatedAt, answeredInRound);
     }
+
+    int192 public boundMin = 1;
+    int192 public boundMax = type(int192).max;
+
+    function setBounds(int192 mn, int192 mx) external {
+        boundMin = mn;
+        boundMax = mx;
+    }
+
+    function aggregator() external view returns (address) {
+        return address(this);
+    }
+
+    function minAnswer() external view returns (int192) {
+        return boundMin;
+    }
+
+    function maxAnswer() external view returns (int192) {
+        return boundMax;
+    }
 }
 
 contract MockCakeOraclePool is IPancakeV3Pool {
@@ -214,7 +234,7 @@ contract VaultBCakeExecutionV2Test is Test {
 
     function _deployGuard() internal returns (VaultBCakePriceGuard) {
         return
-            new VaultBCakePriceGuard(100, 1_000, 500, 5_100e18, 50_000e18, 1_800, 3_600, 90_000, 600, admin, guardian);
+        new VaultBCakePriceGuard(100, 1_000, 500, 1_000, 5_100e18, 50_000e18, 1_800, 3_600, 90_000, 600, admin, guardian);
     }
 
     function testQuoteUsesLowerIndependentSourceAndOnePercentFloor() public view {
@@ -272,6 +292,39 @@ contract VaultBCakeExecutionV2Test is Test {
         _setHealthyFeeds();
         vm.expectRevert(VaultBCakePriceGuard.EmergencyBudgetInactive.selector);
         guard.minimumOut(1e18, true);
+    }
+
+    // ── B5-T1 (CAKE mirror) ───────────────────────────────────────────────
+    function test_EmergencyDeviationWiderThanNormalPasses() public {
+        crossPool.setTwapTick(650); // ~670 bps: > normal 500, < emergency 1000
+        vm.expectPartialRevert(VaultBCakePriceGuard.OracleDeviation.selector);
+        guard.quote(1e18, false);
+
+        vm.prank(guardian);
+        guard.activateEmergencyBudget(1_000, uint64(block.timestamp + 300));
+        VaultBCakePriceGuard.Quote memory q = guard.quote(1e18, true);
+        assertGt(q.minOut, 0, "CAKE emergency exit quotes through the wider band");
+    }
+
+    function test_DeviationAboveEmergencyCeilingStillReverts() public {
+        crossPool.setTwapTick(1_200); // ~1270 bps > emergency 1000
+        vm.prank(guardian);
+        guard.activateEmergencyBudget(1_000, uint64(block.timestamp + 300));
+        vm.expectPartialRevert(VaultBCakePriceGuard.OracleDeviation.selector);
+        guard.quote(1e18, true);
+    }
+
+    function test_FeedPinnedAtAggregatorBoundReverts() public {
+        bnbFeed.setBounds(1e8, 1e12); // healthy answer sits on minAnswer
+        vm.expectPartialRevert(VaultBCakePriceGuard.OracleAtBound.selector);
+        guard.quote(1e18, false);
+    }
+
+    function test_ConfigRejectsAbsurdNormalLoss() public {
+        vm.expectRevert(VaultBCakePriceGuard.InvalidConfiguration.selector);
+        new VaultBCakePriceGuard(
+            2_000, 2_000, 500, 1_000, 5_100e18, 50_000e18, 1_800, 3_600, 90_000, 600, admin, guardian
+        );
     }
 
     function testEmergencyBudgetRejectsOutsiderAndOverCap() public {

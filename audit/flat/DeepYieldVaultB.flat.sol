@@ -4561,6 +4561,21 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     mapping(uint256 => RedeemRequest) public redeemRequests;
     mapping(address => uint256) public pendingRequestPlusOne;
 
+    /// @notice Assets owed to a receiver whose push payout failed (e.g. a
+    /// blacklisted BSC-USD address). The request still settles so the cycle moves;
+    /// the receiver pulls later with `withdrawClaimable`. Excluded from
+    /// `totalAssets` because it is a liability, not shareholder value.
+    mapping(address => uint256) public claimableAssets;
+    uint256 public totalClaimableAssets;
+
+    /// @notice Timelocked strategy change. `setStrategy` bootstraps the first
+    /// strategy instantly; changing an existing one goes proposeStrategy -> wait
+    /// STRATEGY_TIMELOCK -> applyStrategy, so holders can exit before the vault's
+    /// unlimited allowance is redirected.
+    uint256 public constant STRATEGY_TIMELOCK = 2 days;
+    address public pendingStrategy;
+    uint64 public pendingStrategyReadyAt;
+
     error ZeroAddress();
     error ZeroAmount();
     error DepositCapExceeded();
@@ -4582,6 +4597,10 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     error RedeemCycleExecutionLossExceeded(uint256 effectiveLoss, uint256 maximumLoss, uint256 requiredTopUp);
     error RedeemCyclePayoutUnderfunded(uint256 payoutBeforeCharge, uint256 executionLossCharge);
     error TooManyShares();
+    error NothingClaimable();
+    error StrategyAlreadySet();
+    error NoPendingStrategy();
+    error StrategyTimelockNotElapsed(uint64 readyAt);
 
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
     event StrategyUpdated(address indexed oldStrategy, address indexed newStrategy);
@@ -4605,6 +4624,9 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     event RedeemClaimed(uint256 indexed requestId, address indexed receiver, uint256 shares, uint256 assets);
     event RedeemReceiverUpdated(uint256 indexed requestId, address indexed oldReceiver, address indexed newReceiver);
     event RedeemCanceled(uint256 indexed requestId, address indexed owner, uint256 shares);
+    event RedeemEscrowed(address indexed receiver, uint256 assets);
+    event ClaimableWithdrawn(address indexed owner, address indexed to, uint256 assets);
+    event StrategyProposed(address indexed newStrategy, uint64 readyAt);
 
     constructor(
         IERC20 asset_,
@@ -4635,10 +4657,42 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     function totalAssets() public view override returns (uint256) {
         uint256 idle = IERC20(asset()).balanceOf(address(this));
         uint256 deployed = address(strategy) == address(0) ? 0 : strategy.estimatedTotalAssets();
-        return idle + deployed;
+        // Escrowed (failed-payout) assets sit in idle but are owed out, so they
+        // are not shareholder value. Deliberately still reverts if the strategy
+        // reverts: a silent zero here would zero the ERC-4626 share price.
+        return idle + deployed - totalClaimableAssets;
     }
 
+    /// @notice Bootstrap the FIRST strategy instantly (no allowance/funds to rug
+    /// yet). Changing an existing strategy must go through proposeStrategy ->
+    /// applyStrategy so the timelock protects the redirected allowance.
     function setStrategy(address newStrategy) external onlyRole(ADMIN_ROLE) {
+        if (address(strategy) != address(0)) revert StrategyAlreadySet();
+        _activateStrategy(newStrategy);
+    }
+
+    /// @notice Announce a strategy change; holders can exit during the timelock.
+    function proposeStrategy(address newStrategy) external onlyRole(ADMIN_ROLE) {
+        if (newStrategy == address(0)) revert ZeroAddress();
+        IVaultBAsyncStrategy candidate = IVaultBAsyncStrategy(newStrategy);
+        if (address(candidate.asset()) != asset() || candidate.vault() != address(this)) {
+            revert StrategyWiringMismatch();
+        }
+        pendingStrategy = newStrategy;
+        pendingStrategyReadyAt = uint64(block.timestamp + STRATEGY_TIMELOCK);
+        emit StrategyProposed(newStrategy, pendingStrategyReadyAt);
+    }
+
+    function applyStrategy() external onlyRole(ADMIN_ROLE) {
+        address next = pendingStrategy;
+        if (next == address(0)) revert NoPendingStrategy();
+        if (block.timestamp < pendingStrategyReadyAt) revert StrategyTimelockNotElapsed(pendingStrategyReadyAt);
+        pendingStrategy = address(0);
+        pendingStrategyReadyAt = 0;
+        _activateStrategy(next);
+    }
+
+    function _activateStrategy(address newStrategy) internal {
         if (newStrategy == address(0)) revert ZeroAddress();
         if (outstandingRedeemShares != 0) revert RedeemQueueActive(outstandingRedeemShares);
         address oldStrategy = address(strategy);
@@ -4676,16 +4730,41 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         _unpause();
     }
 
+    /// @notice ERC-4626 requires max* not to revert. Every strategy call here is
+    /// guarded so a reverting strategy fails safe to 0 (no new deposits) rather
+    /// than reverting for integrators. totalAssets() is deliberately left able to
+    /// revert (see there); this function does not call it.
     function maxDeposit(address) public view override returns (uint256) {
-        if (paused() || redeemCycleCommitted()) return 0;
-        if (address(strategy) != address(0) && !strategy.depositsAllowed()) return 0;
+        if (paused() || _redeemCycleCommitted) return 0;
+        IVaultBAsyncStrategy s = strategy;
+        uint256 deployed;
+        if (address(s) != address(0)) {
+            try s.withdrawalCycleCommitted() returns (bool committed) {
+                if (committed) return 0;
+            } catch {
+                return 0;
+            }
+            try s.depositsAllowed() returns (bool allowed) {
+                if (!allowed) return 0;
+            } catch {
+                return 0;
+            }
+            try s.estimatedTotalAssets() returns (uint256 d) {
+                deployed = d;
+            } catch {
+                return 0;
+            }
+        }
         if (depositCap == 0) return type(uint256).max;
-        uint256 managed = totalAssets();
+        uint256 managed = IERC20(asset()).balanceOf(address(this)) + deployed - totalClaimableAssets;
         return managed >= depositCap ? 0 : depositCap - managed;
     }
 
     function maxMint(address receiver) public view override returns (uint256) {
         uint256 assets = maxDeposit(receiver);
+        // maxDeposit already returned 0 on any strategy failure, so convertToShares
+        // (which reads totalAssets) is only reached when the strategy is healthy.
+        if (assets == 0) return 0;
         return assets == type(uint256).max ? type(uint256).max : convertToShares(assets);
     }
 
@@ -4819,15 +4898,37 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         if (outstandingRedeemCount == 0) revert RedeemRequestUnknown();
         if (_redeemCycleCommitted) revert RedeemCycleLocked();
         IVaultBAsyncStrategy activeStrategy = strategy;
+
+        // If Main already auto-committed the cycle (a keeper began an LP close
+        // with requests outstanding), the batch is already locked vault-wide, so
+        // the 5% threshold no longer gates anything and re-committing the
+        // strategy would revert on its one-way door. Take our snapshot now so
+        // settlement runs the batch math (2% cap + pro-rata) rather than live
+        // per-claim NAV, without touching the strategy again.
+        if (activeStrategy.withdrawalCycleCommitted()) {
+            _takeRedeemCycleSnapshot(0);
+            return;
+        }
+
         uint256 threshold = commitThresholdShares();
         if (outstandingRedeemShares < threshold) revert RedeemCycleNotReady(outstandingRedeemShares, threshold);
-        if (activeStrategy.withdrawalCycleCommitted()) revert RedeemCycleLocked();
+        activeStrategy.commitWithdrawalCycle();
+        _takeRedeemCycleSnapshot(threshold);
+    }
 
+    /// @notice Freeze the batch basis (supply, NAV, committed shares) used by
+    /// settlement. Supply and committed shares are invariant across the whole
+    /// settlement window — every deposit/mint/request/cancel gate reads the
+    /// combined committed view and is frozen while committed — so the moment the
+    /// snapshot is taken (timely local commit, or lazily after Main's
+    /// auto-commit) cannot change the batch price a redeemer receives. Only the
+    /// NAV snapshot bounds the 2% execution-loss cap; a later (post-close)
+    /// snapshot yields a strictly conservative cap and never a worse price.
+    function _takeRedeemCycleSnapshot(uint256 threshold) internal {
         redeemCycleSupplySnapshot = totalSupply();
         redeemCycleAssetsSnapshot = totalAssets();
         redeemCycleCommittedShares = outstandingRedeemShares;
         _redeemCycleCommitted = true;
-        activeStrategy.commitWithdrawalCycle();
         emit RedeemCycleCommittedEvent(
             redeemCycleCommittedShares, threshold, redeemCycleSupplySnapshot, redeemCycleAssetsSnapshot
         );
@@ -4860,7 +4961,12 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         if (!activeStrategy.withdrawalReady(request.strategyRequestId)) revert RedeemNotReady();
 
         uint256 shares = request.shares;
-        if (_redeemCycleCommitted) {
+        // Route on the combined committed view, not the raw local flag: if Main
+        // auto-committed the cycle first, the local flag is unreachable, and the
+        // old raw-flag check silently settled at live NAV (no cap, no pro-rata).
+        // Materialize the snapshot lazily on the first claim of such a cycle.
+        if (redeemCycleCommitted()) {
+            if (!_redeemCycleCommitted) _takeRedeemCycleSnapshot(0);
             if (!redeemCycleSettlementInitialized) _initializeRedeemCycleSettlement(activeStrategy);
             assets = shares == outstandingRedeemShares
                 ? redeemCyclePayoutAssets - redeemCyclePayoutClaimed
@@ -4877,17 +4983,46 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         outstandingRedeemCount -= 1;
         pendingRequestPlusOne[request.owner] = 0;
 
+        // `<`, matching _ensureLiquidity: a strategy that returns 1 wei more than
+        // requested (lot rounding) must not permanently jam this one claim and,
+        // through it, the whole vault. Any surplus stays idle as shareholder value.
         uint256 withdrawn = activeStrategy.claimWithdrawal(request.strategyRequestId, missing);
-        if (withdrawn != missing) revert StrategyShortfall(missing, withdrawn);
+        if (withdrawn < missing) revert StrategyShortfall(missing, withdrawn);
         if (IERC20(asset()).balanceOf(address(this)) < assets) {
             revert StrategyShortfall(assets, IERC20(asset()).balanceOf(address(this)));
         }
 
         _burn(address(this), shares);
-        if (assets != 0) IERC20(asset()).safeTransfer(request.receiver, assets);
+        // Never let a blacklisted receiver push-revert jam the cycle: on transfer
+        // failure the amount is escrowed as claimable and the request still settles.
+        if (assets != 0) _payOrEscrow(request.receiver, assets);
         if (outstandingRedeemCount == 0) _clearRedeemCycle();
         emit Withdraw(msg.sender, request.receiver, request.owner, assets, shares);
         emit RedeemClaimed(requestId, request.receiver, shares, assets);
+    }
+
+    /// @dev Push the payout; if the transfer reverts OR returns false (a
+    /// blacklisted BSC-USD receiver does the former), escrow it as claimable so
+    /// the claim still settles and the cycle keeps moving.
+    function _payOrEscrow(address to, uint256 amount) internal {
+        (bool success, bytes memory data) =
+            asset().call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        if (success && (data.length == 0 || abi.decode(data, (bool)))) return;
+        claimableAssets[to] += amount;
+        totalClaimableAssets += amount;
+        emit RedeemEscrowed(to, amount);
+    }
+
+    /// @notice Withdraw assets escrowed for msg.sender (a failed push payout) to
+    /// any address — so a blacklisted original receiver can recover to a clean one.
+    function withdrawClaimable(address to) external nonReentrant returns (uint256 amount) {
+        if (to == address(0)) revert ZeroAddress();
+        amount = claimableAssets[msg.sender];
+        if (amount == 0) revert NothingClaimable();
+        claimableAssets[msg.sender] = 0;
+        totalClaimableAssets -= amount;
+        IERC20(asset()).safeTransfer(to, amount);
+        emit ClaimableWithdrawn(msg.sender, to, amount);
     }
 
     function updateRedeemReceiver(uint256 requestId, address newReceiver) external nonReentrant {
@@ -4933,17 +5068,25 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
             request.status != RedeemStatus.PENDING || address(activeStrategy) == address(0)
                 || !activeStrategy.withdrawalReady(request.strategyRequestId)
         ) return 0;
-        if (_redeemCycleCommitted) {
+        if (redeemCycleCommitted()) {
+            // When Main auto-committed but no claim/commit has snapshotted yet,
+            // preview against the frozen live basis (supply, outstanding shares,
+            // current NAV) — the same values the first claim will snapshot — so
+            // the preview equals the amount that claim will actually pay.
+            uint256 supply = _redeemCycleCommitted ? redeemCycleSupplySnapshot : totalSupply();
+            uint256 batchShares = _redeemCycleCommitted ? redeemCycleCommittedShares : outstandingRedeemShares;
+            uint256 assetsSnapshot = _redeemCycleCommitted ? redeemCycleAssetsSnapshot : totalAssets();
             uint256 payout = redeemCyclePayoutAssets;
             if (!redeemCycleSettlementInitialized) {
-                (bool valid, uint256 previewPayout) = _previewRedeemCycleSettlement(activeStrategy);
+                (bool valid, uint256 previewPayout) =
+                    _previewRedeemCycleSettlement(activeStrategy, supply, batchShares, assetsSnapshot);
                 if (!valid) return 0;
                 payout = previewPayout;
             }
             if (request.shares == outstandingRedeemShares && redeemCycleSettlementInitialized) {
                 return payout - redeemCyclePayoutClaimed;
             }
-            return Math.mulDiv(payout, request.shares, redeemCycleCommittedShares);
+            return Math.mulDiv(payout, request.shares, batchShares);
         }
         return previewRedeem(request.shares);
     }
@@ -4953,8 +5096,12 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     /// not authorize a wider loss budget.
     function fundRedeemCycleDeficit(uint256 assets) external nonReentrant {
         if (msg.sender != treasury) revert NotTreasury();
-        if (!_redeemCycleCommitted || redeemCycleSettlementInitialized) revert RedeemCycleLocked();
+        if (!redeemCycleCommitted() || redeemCycleSettlementInitialized) revert RedeemCycleLocked();
         if (assets == 0) revert ZeroAmount();
+        // Treasury may fund before the first claim even when Main auto-committed;
+        // materialize the snapshot first so the credit sits on a coherent batch
+        // and the cap base excludes the funding just added.
+        if (!_redeemCycleCommitted) _takeRedeemCycleSnapshot(0);
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), assets);
         redeemCycleProtocolCredit += assets;
         emit RedeemCycleDeficitFunded(msg.sender, assets, redeemCycleProtocolCredit);
@@ -4986,7 +5133,9 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
             revert RedeemCycleExecutionLossExceeded(effective, maximum, effective - maximum);
         }
 
-        (bool valid, uint256 payout) = _previewRedeemCycleSettlement(activeStrategy);
+        (bool valid, uint256 payout) = _previewRedeemCycleSettlement(
+            activeStrategy, redeemCycleSupplySnapshot, redeemCycleCommittedShares, redeemCycleAssetsSnapshot
+        );
         if (!valid) {
             uint256 currentAssets = totalAssets();
             uint256 basePayout = Math.mulDiv(currentAssets, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
@@ -5004,13 +5153,12 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         emit RedeemCycleSettlementInitialized(payout, measured, redeemCycleProtocolCredit, charged);
     }
 
-    function _previewRedeemCycleSettlement(IVaultBAsyncStrategy activeStrategy)
-        internal
-        view
-        returns (bool valid, uint256 payout)
-    {
-        uint256 supply = redeemCycleSupplySnapshot;
-        uint256 batchShares = redeemCycleCommittedShares;
+    function _previewRedeemCycleSettlement(
+        IVaultBAsyncStrategy activeStrategy,
+        uint256 supply,
+        uint256 batchShares,
+        uint256 assetsSnapshot
+    ) internal view returns (bool valid, uint256 payout) {
         if (supply == 0 || batchShares == 0 || batchShares > supply) return (false, 0);
 
         uint256 currentAssets = totalAssets();
@@ -5021,7 +5169,7 @@ contract DeepYieldVaultB is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         if (chargeable > measured) return (false, 0);
         uint256 effective = measured > redeemCycleProtocolCredit ? measured - redeemCycleProtocolCredit : 0;
         uint256 charged = chargeable > redeemCycleProtocolCredit ? chargeable - redeemCycleProtocolCredit : 0;
-        uint256 maximum = Math.mulDiv(redeemCycleAssetsSnapshot, MAX_BATCH_EXECUTION_LOSS_BPS, BPS);
+        uint256 maximum = Math.mulDiv(assetsSnapshot, MAX_BATCH_EXECUTION_LOSS_BPS, BPS);
         if (effective > maximum) return (false, 0);
 
         uint256 basePayout = Math.mulDiv(currentAssets, batchShares, supply);

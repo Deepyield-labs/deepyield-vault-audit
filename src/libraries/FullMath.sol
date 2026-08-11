@@ -34,29 +34,35 @@ library FullMath {
             prod0 := sub(prod0, remainder)
         }
 
-        uint256 twos = (~denominator + 1) & denominator;
-        assembly {
-            denominator := div(denominator, twos)
-        }
+        // The 512-bit path relies on wrapping (mod 2**256) arithmetic that is
+        // canonical under pre-0.8 Solidity; under ^0.8 it must be `unchecked`, or
+        // the intended overflows revert. The two require()s above stay outside as
+        // real reverts (they must not be silenced).
+        unchecked {
+            uint256 twos = (~denominator + 1) & denominator;
+            assembly {
+                denominator := div(denominator, twos)
+            }
 
-        assembly {
-            prod0 := div(prod0, twos)
-        }
-        assembly {
-            twos := add(div(sub(0, twos), twos), 1)
-        }
-        prod0 |= prod1 * twos;
+            assembly {
+                prod0 := div(prod0, twos)
+            }
+            assembly {
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+            prod0 |= prod1 * twos;
 
-        uint256 inv = (3 * denominator) ^ 2;
-        inv *= 2 - denominator * inv; // inverse mod 2**8
-        inv *= 2 - denominator * inv; // inverse mod 2**16
-        inv *= 2 - denominator * inv; // inverse mod 2**32
-        inv *= 2 - denominator * inv; // inverse mod 2**64
-        inv *= 2 - denominator * inv; // inverse mod 2**128
-        inv *= 2 - denominator * inv; // inverse mod 2**256
+            uint256 inv = (3 * denominator) ^ 2;
+            inv *= 2 - denominator * inv; // inverse mod 2**8
+            inv *= 2 - denominator * inv; // inverse mod 2**16
+            inv *= 2 - denominator * inv; // inverse mod 2**32
+            inv *= 2 - denominator * inv; // inverse mod 2**64
+            inv *= 2 - denominator * inv; // inverse mod 2**128
+            inv *= 2 - denominator * inv; // inverse mod 2**256
 
-        result = prod0 * inv;
-        return result;
+            result = prod0 * inv;
+            return result;
+        }
     }
 
     function mulDivRoundingUp(

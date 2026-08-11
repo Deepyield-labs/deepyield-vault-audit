@@ -39,6 +39,7 @@ contract DeployVaultBV2DryRunTest is Test {
             normalSwapLossBps: 100,
             maxEmergencySwapLossBps: 1_000,
             maxOracleDeviationBps: 500,
+            maxEmergencyOracleDeviationBps: 1_000,
             mintLossBps: 100,
             normalCloseLossBps: 100,
             emergencyCloseLossBps: 1_000,

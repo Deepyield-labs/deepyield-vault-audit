@@ -8,6 +8,13 @@ import {IChainlinkAggregatorV3, IVaultBRewardPriceGuard} from "./interfaces/IVau
 import {FullMath} from "./libraries/FullMath.sol";
 import {TickMath} from "./libraries/TickMath.sol";
 
+/// @dev Circuit-breaker bounds of a Chainlink OCR feed (see VaultBPriceGuard).
+interface IChainlinkBounds {
+    function aggregator() external view returns (address);
+    function minAnswer() external view returns (int192);
+    function maxAnswer() external view returns (int192);
+}
+
 /// @notice On-chain lower bound for Vault B CAKE-to-USDT liquidation.
 /// It cross-checks a direct CAKE/USDT TWAP against an independent
 /// CAKE/WBNB TWAP converted through Chainlink BNB/USD and USDT/USD.
@@ -15,6 +22,8 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
 
     uint256 internal constant BPS = 10_000;
+    uint16 public constant HARD_MAX_LOSS_BPS = 1_000; // 10%
+    uint16 public constant HARD_MAX_DEVIATION_BPS = 1_000; // 10%
 
     address public constant CAKE = 0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82;
     address public constant USDT = 0x55d398326f99059fF775485246999027B3197955;
@@ -35,6 +44,7 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
     uint16 public immutable normalLossBps;
     uint16 public immutable maxEmergencyLossBps;
     uint16 public immutable maxOracleDeviationBps;
+    uint16 public immutable maxEmergencyOracleDeviationBps;
     uint256 public immutable maxNormalNotional;
     uint256 public immutable maxEmergencyNotional;
     uint32 public immutable twapWindow;
@@ -56,6 +66,7 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
     error IncompleteOracleRound(address feed, uint80 roundId, uint80 answeredInRound);
     error UnsupportedOracleDecimals(address feed, uint8 decimals);
     error OracleDeviation(uint256 directOut, uint256 compositeOut, uint256 deviationBps);
+    error OracleAtBound(address feed, int256 answer, int192 minAnswer, int192 maxAnswer);
     error CapacityExceeded(uint256 notional, uint256 cap);
     error TwapUnavailable(address pool);
     error EmergencyBudgetInactive();
@@ -77,6 +88,7 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
         uint16 normalLossBps_,
         uint16 maxEmergencyLossBps_,
         uint16 maxOracleDeviationBps_,
+        uint16 maxEmergencyOracleDeviationBps_,
         uint256 maxNormalNotional_,
         uint256 maxEmergencyNotional_,
         uint32 twapWindow_,
@@ -89,10 +101,13 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
         if (block.chainid != 56) revert WrongChain(block.chainid);
         if (admin_ == address(0) || guardian_ == address(0)) revert ZeroAddress();
         if (
-            normalLossBps_ == 0 || normalLossBps_ >= BPS || maxEmergencyLossBps_ < normalLossBps_
-                || maxEmergencyLossBps_ >= BPS || maxOracleDeviationBps_ == 0 || maxOracleDeviationBps_ >= BPS
-                || maxNormalNotional_ == 0 || maxEmergencyNotional_ < maxNormalNotional_ || twapWindow_ < 60
-                || maxBnbFeedAge_ == 0 || maxUsdtFeedAge_ == 0 || maxEmergencyDuration_ == 0
+            normalLossBps_ == 0 || normalLossBps_ > HARD_MAX_LOSS_BPS || maxEmergencyLossBps_ < normalLossBps_
+                || maxEmergencyLossBps_ > HARD_MAX_LOSS_BPS || maxOracleDeviationBps_ == 0
+                || maxOracleDeviationBps_ > HARD_MAX_DEVIATION_BPS
+                || maxEmergencyOracleDeviationBps_ < maxOracleDeviationBps_
+                || maxEmergencyOracleDeviationBps_ > HARD_MAX_DEVIATION_BPS || maxNormalNotional_ == 0
+                || maxEmergencyNotional_ < maxNormalNotional_ || twapWindow_ < 60 || maxBnbFeedAge_ == 0
+                || maxUsdtFeedAge_ == 0 || maxEmergencyDuration_ == 0
         ) revert InvalidConfiguration();
 
         _validatePool(directPool, USDT, DIRECT_ORACLE_FEE);
@@ -101,6 +116,7 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
         normalLossBps = normalLossBps_;
         maxEmergencyLossBps = maxEmergencyLossBps_;
         maxOracleDeviationBps = maxOracleDeviationBps_;
+        maxEmergencyOracleDeviationBps = maxEmergencyOracleDeviationBps_;
         maxNormalNotional = maxNormalNotional_;
         maxEmergencyNotional = maxEmergencyNotional_;
         twapWindow = twapWindow_;
@@ -133,11 +149,11 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
     }
 
     function fairValue(uint256 amountIn) external view returns (uint256) {
-        return _sourceQuote(amountIn).fairOut;
+        return _sourceQuote(amountIn, false).fairOut;
     }
 
     function quote(uint256 amountIn, bool emergency) public view returns (Quote memory q) {
-        q = _sourceQuote(amountIn);
+        q = _sourceQuote(amountIn, emergency);
         uint256 cap = emergency ? maxEmergencyNotional : maxNormalNotional;
         if (q.fairOut > cap) revert CapacityExceeded(q.fairOut, cap);
 
@@ -146,7 +162,7 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
         if (q.minOut == 0) revert InvalidAmount();
     }
 
-    function _sourceQuote(uint256 amountIn) internal view returns (Quote memory q) {
+    function _sourceQuote(uint256 amountIn, bool emergency) internal view returns (Quote memory q) {
         if (amountIn == 0) revert InvalidAmount();
 
         q.directTwapOut = _twapQuote(directPool, amountIn, CAKE, USDT);
@@ -159,7 +175,11 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
         uint256 lower = q.directTwapOut < q.compositeTwapOut ? q.directTwapOut : q.compositeTwapOut;
         uint256 upper = q.directTwapOut > q.compositeTwapOut ? q.directTwapOut : q.compositeTwapOut;
         q.deviationBps = FullMath.mulDiv(upper - lower, BPS, lower);
-        if (q.deviationBps > maxOracleDeviationBps) {
+        // Mode-dependent ceiling: emergencies tolerate a wider gap so the reward
+        // emergency exit is not killed by a real market move; normal is unchanged;
+        // an active guardian budget is still required by `_lossBudget`.
+        uint256 deviationLimit = emergency ? maxEmergencyOracleDeviationBps : maxOracleDeviationBps;
+        if (q.deviationBps > deviationLimit) {
             revert OracleDeviation(q.directTwapOut, q.compositeTwapOut, q.deviationBps);
         }
 
@@ -188,6 +208,8 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
         uint256 age = block.timestamp - updatedAt;
         if (age > maxAge) revert StaleOracle(address(feed), age);
 
+        _checkAggregatorBounds(feed, answer);
+
         uint8 decimals = feed.decimals();
         if (decimals > 36) revert UnsupportedOracleDecimals(address(feed), decimals);
         // `answer > 0` above proves this signed-to-unsigned cast preserves the value.
@@ -196,6 +218,20 @@ contract VaultBCakePriceGuard is AccessControl, IVaultBRewardPriceGuard {
         if (decimals == 18) return unsigned;
         if (decimals < 18) return unsigned * (10 ** (18 - decimals));
         return unsigned / (10 ** (decimals - 18));
+    }
+
+    /// @notice Reject a Chainlink answer pinned to its aggregator's min/maxAnswer
+    /// circuit breaker; read defensively (see VaultBPriceGuard).
+    function _checkAggregatorBounds(IChainlinkAggregatorV3 feed, int256 answer) internal view {
+        try IChainlinkBounds(address(feed)).aggregator() returns (address agg) {
+            try IChainlinkBounds(agg).minAnswer() returns (int192 mn) {
+                try IChainlinkBounds(agg).maxAnswer() returns (int192 mx) {
+                    if (mx > mn && (answer <= int256(mn) || answer >= int256(mx))) {
+                        revert OracleAtBound(address(feed), answer, mn, mx);
+                    }
+                } catch {}
+            } catch {}
+        } catch {}
     }
 
     function _twapQuote(IPancakeV3Pool sourcePool, uint256 amountIn, address tokenIn, address tokenOut)

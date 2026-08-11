@@ -22,6 +22,7 @@ contract VaultBExecutionV2ForkTest is Test {
             normalLossBps_: 100,
             maxEmergencyLossBps_: 1_000,
             maxOracleDeviationBps_: 500,
+            maxEmergencyOracleDeviationBps_: 1_000,
             twapWindow_: 1_800,
             maxBnbFeedAge_: 3_600,
             maxUsdtFeedAge_: 90_000,

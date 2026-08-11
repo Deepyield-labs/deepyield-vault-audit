@@ -185,6 +185,11 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
             executor.bindMain(address(main));
             rewardExecutor.bindMain(address(main));
             venue.bindController(address(main));
+            vm.mockCall(
+                0x172fcD41E0913e95784454622d1c3724f546f849,
+                abi.encodeWithSignature("slot0()"),
+                abi.encode(uint160(0x1000000000000000000000000), int24(0), uint16(0), uint16(0), uint16(0), uint32(0), true)
+            );
             usdt.mint(address(executor), 100_000e18);
             usdt.mint(address(rewardExecutor), 100_000e18);
             wbnb.mint(address(executor), 100_000e18);
@@ -422,8 +427,12 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
             uint256 supplyBefore = vault.totalSupply();
             uint256 userSharesBefore = vault.balanceOf(alice);
             uint256 navBefore = vault.totalAssets();
+            // B3-T2: changing an existing strategy is now timelocked (propose/apply).
             vm.prank(admin);
-            vault.setStrategy(address(destination));
+            vault.proposeStrategy(address(destination));
+            vm.warp(block.timestamp + vault.STRATEGY_TIMELOCK());
+            vm.prank(admin);
+            vault.applyStrategy();
 
             assertEq(vault.totalSupply(), supplyBefore);
             assertEq(vault.balanceOf(alice), userSharesBefore);
@@ -431,19 +440,24 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
             assertEq(shares, userSharesBefore);
         }
 
+        // B3-T2: wrong wiring is rejected at propose; a non-empty current strategy
+        // is rejected at apply. (Named in the B3-T2 report.)
         function testStrategyCutoverRejectsNonEmptyCurrentAndWrongDestinationWiring() public {
             _depositAndDeploy(alice, 1_000e18);
             MockAsyncDestinationStrategy destination = new MockAsyncDestinationStrategy(IERC20(USDT), address(vault));
             vm.prank(admin);
+            vault.proposeStrategy(address(destination));
+            vm.warp(block.timestamp + vault.STRATEGY_TIMELOCK());
+            vm.prank(admin);
             vm.expectRevert(DeepYieldVaultB.StrategyNotEmpty.selector);
-            vault.setStrategy(address(destination));
+            vault.applyStrategy();
 
             vm.prank(manager);
             adapter.managerWithdrawAll();
             MockAsyncDestinationStrategy wrong = new MockAsyncDestinationStrategy(IERC20(USDT), bob);
             vm.prank(admin);
             vm.expectRevert(DeepYieldVaultB.StrategyWiringMismatch.selector);
-            vault.setStrategy(address(wrong));
+            vault.proposeStrategy(address(wrong));
         }
 
         function _depositAndDeploy(address user, uint256 assets) internal returns (uint256 shares) {
