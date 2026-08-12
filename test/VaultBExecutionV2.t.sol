@@ -12,8 +12,11 @@ import {IPancakeV3Pool} from "../src/interfaces/IPancakeSwapV3.sol";
 import {
     IChainlinkAggregatorV3,
     IPancakeV3SwapRouterWithDeadline,
+    IVaultBExecutionAdapterV2,
     IVaultBPriceGuard
 } from "../src/interfaces/IVaultBExecutionV2.sol";
+import {Job} from "../src/libraries/MainV2Jobs.sol";
+import {LiqParams, MainV2Liquidation} from "../src/libraries/MainV2Liquidation.sol";
 
 contract MockCanonicalToken is ERC20 {
     constructor() ERC20("Mock Canonical", "MC") {}
@@ -46,6 +49,26 @@ contract MockVaultBFeed is IChainlinkAggregatorV3 {
 
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
         return (roundId, answer, updatedAt, updatedAt, answeredInRound);
+    }
+
+    int192 public boundMin = 1;
+    int192 public boundMax = type(int192).max;
+
+    function setBounds(int192 mn, int192 mx) external {
+        boundMin = mn;
+        boundMax = mx;
+    }
+
+    function aggregator() external view returns (address) {
+        return address(this);
+    }
+
+    function minAnswer() external view returns (int192) {
+        return boundMin;
+    }
+
+    function maxAnswer() external view returns (int192) {
+        return boundMax;
     }
 }
 
@@ -135,6 +158,60 @@ contract MockPinnedPancakeRouter is IPancakeV3SwapRouterWithDeadline {
     }
 }
 
+interface IRound8DefaultAdminRules {
+    function defaultAdminDelay() external view returns (uint48);
+    function beginDefaultAdminTransfer(address newAdmin) external;
+    function acceptDefaultAdminTransfer() external;
+}
+
+contract MockWrongFeePriceGuard {
+    function POOL_FEE() external pure returns (uint24) {
+        return 500;
+    }
+}
+
+contract Round8WbnbLiquidationHarness {
+    mapping(bytes32 => Job) internal jobs;
+    mapping(bytes32 => mapping(uint32 => bool)) internal usedChunks;
+    mapping(uint64 => uint256) internal dailySwapNotional;
+
+    IERC20 internal immutable pairedToken;
+    IVaultBExecutionAdapterV2 internal immutable executionAdapter;
+    IVaultBPriceGuard internal immutable priceGuard;
+
+    constructor(IERC20 pairedToken_, IVaultBExecutionAdapterV2 executionAdapter_, IVaultBPriceGuard priceGuard_) {
+        pairedToken = pairedToken_;
+        executionAdapter = executionAdapter_;
+        priceGuard = priceGuard_;
+    }
+
+    function liquidateEmergency(uint256 amount)
+        external
+        returns (uint256 amountOut, uint256 amountIn, uint256 notional)
+    {
+        return MainV2Liquidation.liquidateWbnb(
+            jobs,
+            usedChunks,
+            dailySwapNotional,
+            pairedToken,
+            executionAdapter,
+            priceGuard,
+            LiqParams({
+                jobId: keccak256("round8-metered-wbnb"),
+                chunkIndex: 0,
+                keeperMinOut: 1,
+                deadline: block.timestamp + 60,
+                finalChunk: true,
+                emergency: true,
+                hardMaxActiveAssets: amount,
+                swapPerJobCap: amount,
+                dailySwapLimit: amount,
+                dustTolerance: 0
+            })
+        );
+    }
+}
+
 contract VaultBExecutionV2Test is Test {
     address internal constant USDT = 0x55d398326f99059fF775485246999027B3197955;
     address internal constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
@@ -187,6 +264,8 @@ contract VaultBExecutionV2Test is Test {
         guard = _deployGuard();
         adapter = new BoundedPancakeExecutionAdapterV2(address(this), IVaultBPriceGuard(address(guard)), 120);
         adapter.bindMain(address(this));
+        vm.prank(admin);
+        guard.grantRole(keccak256("EMERGENCY_CONSUMER_ROLE"), address(adapter));
 
         usdt.mint(ROUTER, 1_000_000e18);
         wbnb.mint(ROUTER, 1_000_000e18);
@@ -211,6 +290,7 @@ contract VaultBExecutionV2Test is Test {
             normalLossBps_: 100,
             maxEmergencyLossBps_: 1_000,
             maxOracleDeviationBps_: 500,
+            maxEmergencyOracleDeviationBps_: 1_000,
             twapWindow_: 1_800,
             maxBnbFeedAge_: 3_600,
             maxUsdtFeedAge_: 90_000,
@@ -250,10 +330,9 @@ contract VaultBExecutionV2Test is Test {
         guard.minimumOut(USDT, WBNB, 1e18, false);
     }
 
-    function testPriceGuardRejectsIncompleteRound() public {
+    function testPriceGuardAcceptsFreshRoundAcrossAggregatorPhase() public {
         bnbFeed.set(8, 7, 1e8, block.timestamp, 6);
-        vm.expectPartialRevert(VaultBPriceGuard.IncompleteOracleRound.selector);
-        guard.minimumOut(USDT, WBNB, 1e18, false);
+        assertEq(guard.minimumOut(USDT, WBNB, 1e18, false), 0.99e18);
     }
 
     function testPriceGuardRejectsOracleTwapDeviation() public {
@@ -274,7 +353,7 @@ contract VaultBExecutionV2Test is Test {
 
         uint64 expiresAt = uint64(block.timestamp + 300);
         vm.prank(guardian);
-        guard.activateEmergencyBudget(1_000, expiresAt);
+        guard.activateEmergencyBudget(1_000, expiresAt, 50_000e18);
         assertEq(guard.minimumOut(USDT, WBNB, 1e18, true), 0.9e18);
 
         vm.warp(expiresAt);
@@ -283,14 +362,70 @@ contract VaultBExecutionV2Test is Test {
         guard.minimumOut(USDT, WBNB, 1e18, true);
     }
 
+    // ── B5-T1 ────────────────────────────────────────────────────────────────
+
+    // A Chainlink-vs-TWAP gap wider than the normal ceiling but within the
+    // emergency ceiling: normal quote reverts, emergency quote (with an active
+    // budget) passes. This is the emergency exit the old code killed.
+    function test_EmergencyDeviationWiderThanNormalPasses() public {
+        _setHealthyFeeds(1e8, 107e6); // chainlink 1.07x twap -> ~700 bps > normal 500, < emergency 1000
+        pool.setTwapTick(0);
+
+        vm.expectPartialRevert(VaultBPriceGuard.OracleDeviation.selector);
+        guard.quote(USDT, WBNB, 1e18, false);
+
+        vm.prank(guardian);
+        guard.activateEmergencyBudget(1_000, uint64(block.timestamp + 300), 50_000e18);
+        VaultBPriceGuard.Quote memory q = guard.quote(USDT, WBNB, 1e18, true);
+        assertGt(q.minOut, 0, "emergency exit quotes through the wider deviation band");
+        assertGt(q.deviationBps, 500);
+    }
+
+    function test_DeviationAboveEmergencyCeilingStillReverts() public {
+        _setHealthyFeeds(1e8, 112e6); // ~1200 bps > emergency 1000
+        pool.setTwapTick(0);
+        vm.prank(guardian);
+        guard.activateEmergencyBudget(1_000, uint64(block.timestamp + 300), 50_000e18);
+        vm.expectPartialRevert(VaultBPriceGuard.OracleDeviation.selector);
+        guard.quote(USDT, WBNB, 1e18, true);
+    }
+
+    function test_FeedPinnedAtAggregatorBoundReverts() public {
+        _setHealthyFeeds(1e8, 1e8);
+        pool.setTwapTick(0);
+        bnbFeed.setBounds(1e8, 1e12); // answer 1e8 sits exactly on minAnswer
+        vm.expectPartialRevert(VaultBPriceGuard.OracleAtBound.selector);
+        guard.quote(USDT, WBNB, 1e18, false);
+    }
+
+    function test_ConfigRejectsAbsurdNormalLoss() public {
+        vm.expectRevert(VaultBPriceGuard.InvalidConfiguration.selector);
+        new VaultBPriceGuard({
+            normalLossBps_: 2_000, // > HARD_MAX_LOSS_BPS 1000
+            maxEmergencyLossBps_: 2_000,
+            maxOracleDeviationBps_: 500,
+            maxEmergencyOracleDeviationBps_: 1_000,
+            twapWindow_: 1_800,
+            maxBnbFeedAge_: 3_600,
+            maxUsdtFeedAge_: 90_000,
+            maxEmergencyDuration_: 600,
+            admin_: admin,
+            guardian_: guardian
+        });
+    }
+
     function testEmergencyBudgetRejectsOutsiderAndOverCap() public {
         vm.prank(outsider);
         vm.expectRevert();
-        guard.activateEmergencyBudget(500, uint64(block.timestamp + 100));
+        guard.activateEmergencyBudget(500, uint64(block.timestamp + 100), 1e18);
 
         vm.prank(guardian);
         vm.expectRevert(VaultBPriceGuard.InvalidEmergencyBudget.selector);
-        guard.activateEmergencyBudget(1_001, uint64(block.timestamp + 100));
+        guard.activateEmergencyBudget(1_001, uint64(block.timestamp + 100), 1e18);
+
+        vm.prank(guardian);
+        vm.expectRevert(VaultBPriceGuard.InvalidEmergencyBudget.selector);
+        guard.activateEmergencyBudget(500, uint64(block.timestamp + 100), 0);
     }
 
     function testKeeperMinOutOneCannotDisableOnChainFloor() public {
@@ -356,5 +491,136 @@ contract VaultBExecutionV2Test is Test {
         adapter.swapAssetToPaired(1_000e18, bounded, block.timestamp + 60, false);
         uint256 expected = bounded > 990e18 ? bounded : 990e18;
         assertEq(router.lastMinOut(), expected);
+    }
+
+    function testRound8EmergencyBudgetIsCumulativeAndDegradesToNormal() public {
+        _activateMeteredBudget(1_000, uint64(block.timestamp + 300), 1_500e18);
+
+        adapter.swapAssetToPaired(1_000e18, 1, block.timestamp + 60, true);
+        assertEq(_emergencyConsumed(), 1_000e18);
+        assertEq(router.lastMinOut(), 900e18);
+
+        adapter.swapAssetToPaired(600e18, 1, block.timestamp + 60, true);
+        assertEq(_emergencyConsumed(), 1_000e18, "normal fallback must not consume emergency budget");
+        assertEq(router.lastMinOut(), 594e18, "insufficient remaining budget must use normal loss floor");
+
+        adapter.swapAssetToPaired(500e18, 1, block.timestamp + 60, true);
+        assertEq(_emergencyConsumed(), 1_500e18);
+        assertEq(router.lastMinOut(), 450e18);
+
+        assertEq(guard.minimumOut(USDT, WBNB, 100e18, true), 99e18, "exhaustion must degrade, not revert");
+    }
+
+    function testRound8FailedSwapDoesNotConsumeEmergencyBudget() public {
+        _activateMeteredBudget(1_000, uint64(block.timestamp + 300), 1_000e18);
+        router.setRate(USDT, WBNB, 0.89e18);
+
+        vm.expectPartialRevert(MockPinnedPancakeRouter.TooLittle.selector);
+        adapter.swapAssetToPaired(1_000e18, 1, block.timestamp + 60, true);
+
+        assertEq(_emergencyConsumed(), 0);
+    }
+
+    function testRound8PostSwapAccountingFailureDoesNotConsumeEmergencyBudget() public {
+        _activateMeteredBudget(1_000, uint64(block.timestamp + 300), 1_000e18);
+        router.setReturnBias(1);
+
+        vm.expectPartialRevert(BoundedPancakeExecutionAdapterV2.RouterOutputMismatch.selector);
+        adapter.swapAssetToPaired(1_000e18, 1, block.timestamp + 60, true);
+
+        assertEq(_emergencyConsumed(), 0);
+    }
+
+    function testRound8InsufficientBudgetRestoresNormalDeviationCeiling() public {
+        _setHealthyFeeds(1e8, 107e6);
+        _activateMeteredBudget(1_000, uint64(block.timestamp + 300), 1e18);
+
+        vm.expectPartialRevert(VaultBPriceGuard.OracleDeviation.selector);
+        guard.quote(USDT, WBNB, 2e18, true);
+        assertEq(_emergencyConsumed(), 0);
+    }
+
+    function testRound8OnlyExecutionAdapterCanConsumeEmergencyBudget() public {
+        _activateMeteredBudget(1_000, uint64(block.timestamp + 300), 1e18);
+
+        vm.prank(outsider);
+        vm.expectRevert();
+        guard.consumeEmergencyNotional(1);
+        assertEq(_emergencyConsumed(), 0);
+    }
+
+    function testRound8MainPostCheckUsesTheSamePreConsumptionEmergencyFloor() public {
+        BoundedPancakeExecutionAdapterV2 meteredAdapter =
+            new BoundedPancakeExecutionAdapterV2(address(this), IVaultBPriceGuard(address(guard)), 120);
+        Round8WbnbLiquidationHarness harness = new Round8WbnbLiquidationHarness(
+            IERC20(WBNB), IVaultBExecutionAdapterV2(address(meteredAdapter)), IVaultBPriceGuard(address(guard))
+        );
+        meteredAdapter.bindMain(address(harness));
+        bytes32 consumerRole = guard.EMERGENCY_CONSUMER_ROLE();
+        vm.prank(admin);
+        guard.grantRole(consumerRole, address(meteredAdapter));
+
+        wbnb.mint(address(harness), 1e18);
+        router.setRate(WBNB, USDT, 0.95e18);
+        _activateMeteredBudget(1_000, uint64(block.timestamp + 300), 1e18);
+
+        (uint256 amountOut,,) = harness.liquidateEmergency(1e18);
+        assertEq(amountOut, 0.95e18);
+        assertEq(_emergencyConsumed(), 1e18);
+    }
+
+    function testRound8MinOutRoundsAgainstCaller() public view {
+        assertEq(guard.minimumOut(USDT, WBNB, 1, false), 1);
+    }
+
+    function testRound8DeviationRoundsAgainstCaller() public {
+        _setHealthyFeeds(10_000, 10_501);
+        vm.expectPartialRevert(VaultBPriceGuard.OracleDeviation.selector);
+        guard.quote(USDT, WBNB, 10_001, false);
+    }
+
+    function testRound8AdapterRejectsGuardWithDifferentPoolFee() public {
+        MockWrongFeePriceGuard wrong = new MockWrongFeePriceGuard();
+        vm.expectRevert();
+        new BoundedPancakeExecutionAdapterV2(address(this), IVaultBPriceGuard(address(wrong)), 120);
+    }
+
+    function testRound8GuardDefaultAdminTransferIsDelayedAndTwoStep() public {
+        IRound8DefaultAdminRules rules = IRound8DefaultAdminRules(address(guard));
+        address nextAdmin = makeAddr("nextAdmin");
+        assertEq(rules.defaultAdminDelay(), 2 days);
+
+        vm.prank(admin);
+        rules.beginDefaultAdminTransfer(nextAdmin);
+        assertTrue(guard.hasRole(guard.DEFAULT_ADMIN_ROLE(), admin));
+        assertFalse(guard.hasRole(guard.DEFAULT_ADMIN_ROLE(), nextAdmin));
+
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(nextAdmin);
+        vm.expectRevert();
+        rules.acceptDefaultAdminTransfer();
+
+        vm.warp(block.timestamp + 1);
+        vm.prank(nextAdmin);
+        rules.acceptDefaultAdminTransfer();
+        assertFalse(guard.hasRole(guard.DEFAULT_ADMIN_ROLE(), admin));
+        assertTrue(guard.hasRole(guard.DEFAULT_ADMIN_ROLE(), nextAdmin));
+    }
+
+    function _activateMeteredBudget(uint16 lossBps, uint64 expiresAt, uint256 notionalLimit) internal {
+        vm.prank(guardian);
+        (bool ok,) = address(guard)
+            .call(
+                abi.encodeWithSignature(
+                    "activateEmergencyBudget(uint16,uint64,uint256)", lossBps, expiresAt, notionalLimit
+                )
+            );
+        assertTrue(ok, "metered emergency activation must succeed");
+    }
+
+    function _emergencyConsumed() internal view returns (uint256 value) {
+        (bool ok, bytes memory data) = address(guard).staticcall(abi.encodeWithSignature("emergencyNotionalConsumed()"));
+        assertTrue(ok, "metered emergency getter missing");
+        value = abi.decode(data, (uint256));
     }
 }

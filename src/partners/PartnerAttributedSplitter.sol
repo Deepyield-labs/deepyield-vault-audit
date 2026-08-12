@@ -53,6 +53,37 @@ contract PartnerAttributedSplitter is AccessControl, ReentrancyGuard, IPartnerAt
     // ── per-wrapper cumulative claimed ──
     mapping(address => uint256) public override cumulativeClaimedPerWrapper;
 
+    // ── F-3: anti-JIT weight checkpoint ──
+    /// @dev `wrapperWeightCheckpoint[W]` is the `effective` value observed at the
+    /// PREVIOUS `recordFee` for a wrapper that has been seen before
+    /// (`wrapperCheckpointed[W]`). Accrual is then weighted by
+    /// `min(current, checkpoint)`, so a JIT top-up made right before a fee cannot
+    /// capture a slice earned by capital that was already there — the top-up only
+    /// counts from the NEXT fee, once it has survived one observation. The FIRST
+    /// observation credits the full `effective` (that capital was genuinely
+    /// present and earned the yield being distributed, e.g. a wrapper whose only
+    /// fee event is its own user's exit). Onboarding is admin-gated
+    /// (`WrapperFactory.deployFirstWrapper` is `onlyRole(ADMIN_ROLE)`), so a
+    /// wrapper cannot be spun up on demand to farm that first-observation credit.
+    mapping(address => uint256) public wrapperWeightCheckpoint;
+    mapping(address => bool)    public wrapperCheckpointed;
+
+    // ── F-6: timelocked project-treasury change ──
+    /// @dev A change of the project treasury is proposed, then applied after
+    /// TREASURY_TIMELOCK, so the current treasury can sweep already-accrued
+    /// project funds (claimProject) before the destination moves. The initial
+    /// treasury is still set instantly in the constructor (bootstrap).
+    uint256 public constant TREASURY_TIMELOCK = 2 days;
+    address public pendingProjectTreasury;
+    uint64  public pendingProjectTreasuryReadyAt;
+
+    // ── local events/errors (splitter-specific, not part of IPartnerAttribution) ──
+    event WrapperSkipped(address indexed wrapper);
+    event ProjectTreasuryProposed(address indexed newTreasury, uint64 readyAt);
+
+    error NoPendingTreasury();
+    error TreasuryTimelockNotElapsed(uint64 readyAt);
+
     // ── project-side pending ──
     uint256 public override pendingProjectBaseSlice;
     uint256 public override pendingProjectHouseSlice;
@@ -95,22 +126,31 @@ contract PartnerAttributedSplitter is AccessControl, ReentrancyGuard, IPartnerAt
     function recordFee(uint256 amount) external override nonReentrant {
         if (amount == 0) return;
 
-        // CEI: pull asset first.
+        // CEI: pull asset first. F-4: credit the MEASURED delta of our own
+        // balance, not the requested `amount`. For a strict ERC-20 they are
+        // equal, but the assumption was never checked — and a token that
+        // delivers less (fee-on-transfer / non-standard) would otherwise inflate
+        // `_totalPending` above the real balance and strand later claims. Same
+        // approach as B4-T3 harvest.
+        uint256 balBefore = asset.balanceOf(address(this));
         asset.safeTransferFrom(msg.sender, address(this), amount);
-        _totalPending += amount;
-        cumulativeReceived += amount;
+        uint256 received = asset.balanceOf(address(this)) - balBefore;
+        if (received == 0) return;
+
+        _totalPending += received;
+        cumulativeReceived += received;
 
         // Lock bps + supply at receipt time. Task 1.32 carry-forward:
         // a later `setPartnerShareBps` does NOT retroactively reprice.
         uint256 bpsLocked = partnerShareBps;
         uint256 totalSupply_ = IERC20(vault).totalSupply();
-        uint256 partnerCut = (amount * bpsLocked) / 10_000;
-        uint256 baseSlice  = amount - partnerCut;
+        uint256 partnerCut = (received * bpsLocked) / 10_000;
+        uint256 baseSlice  = received - partnerCut;
 
         if (totalSupply_ == 0 || partnerCut == 0) {
             pendingProjectBaseSlice  += baseSlice;
             pendingProjectHouseSlice += partnerCut;
-            emit FeeRouted(amount, baseSlice, partnerCut, 0, totalSupply_, bpsLocked);
+            emit FeeRouted(received, baseSlice, partnerCut, 0, totalSupply_, bpsLocked);
             return;
         }
 
@@ -119,12 +159,43 @@ contract PartnerAttributedSplitter is AccessControl, ReentrancyGuard, IPartnerAt
         uint256 n = wrappers.length;
         for (uint256 i = 0; i < n; ++i) {
             address W = wrappers[i];
-            uint256 vBal     = IERC20(vault).balanceOf(W);
-            uint256 receipts = IPartnerWrapper(W).totalReceipts();
-            uint256 effective = vBal < receipts ? vBal : receipts;
-            if (effective == 0) continue;
+            uint256 vBal = IERC20(vault).balanceOf(W); // vault is the trusted ERC4626
 
-            uint256 wSlice = (partnerCut * effective) / totalSupply_;
+            // F-1: `totalReceipts()` is partner code. A revert (broken or
+            // hostile wrapper) must skip THIS wrapper, not brick the whole
+            // distribution. The skipped wrapper's slice is never assigned, so it
+            // falls into the project house residual below — it is NOT
+            // redistributed to the other wrappers (each wSlice is computed from
+            // that wrapper's OWN weight, independent of how many are skipped), so
+            // no one can profit by breaking a neighbour.
+            uint256 receipts;
+            try IPartnerWrapper(W).totalReceipts() returns (uint256 r) {
+                receipts = r;
+            } catch {
+                emit WrapperSkipped(W);
+                continue;
+            }
+            uint256 effective = vBal < receipts ? vBal : receipts;
+
+            // F-3: weight by min(current, checkpoint) once the wrapper has been
+            // seen, so a JIT top-up made right before this fee earns nothing
+            // until it has survived one observation. The first observation
+            // credits the full `effective` — that capital was already present
+            // and earned the yield being distributed (a wrapper whose sole fee
+            // event is its own user's exit must still accrue). Refresh the
+            // checkpoint to `effective` for next time either way.
+            uint256 weight;
+            if (wrapperCheckpointed[W]) {
+                uint256 prev = wrapperWeightCheckpoint[W];
+                weight = effective < prev ? effective : prev;
+            } else {
+                weight = effective;
+                wrapperCheckpointed[W] = true;
+            }
+            wrapperWeightCheckpoint[W] = effective;
+            if (weight == 0) continue;
+
+            uint256 wSlice = (partnerCut * weight) / totalSupply_;
             if (wSlice == 0) continue;
 
             bytes32 pid = IPartnerRegistry(registry).partnerOfWrapper(W);
@@ -140,7 +211,7 @@ contract PartnerAttributedSplitter is AccessControl, ReentrancyGuard, IPartnerAt
         pendingProjectHouseSlice += houseSlice;
         pendingProjectBaseSlice  += baseSlice;
 
-        emit FeeRouted(amount, baseSlice, houseSlice, distributedToWrappers, totalSupply_, bpsLocked);
+        emit FeeRouted(received, baseSlice, houseSlice, distributedToWrappers, totalSupply_, bpsLocked);
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -203,7 +274,15 @@ contract PartnerAttributedSplitter is AccessControl, ReentrancyGuard, IPartnerAt
         uint256 vBal     = IERC20(vault).balanceOf(wrapper);
         uint256 receipts = IPartnerWrapper(wrapper).totalReceipts();
         uint256 effective = vBal < receipts ? vBal : receipts;
-        wrapperSlice = (partnerCut * effective) / totalSupply_;
+        // Mirror recordFee's F-3 anti-JIT weighting so the preview matches what
+        // would actually accrue: full on first observation, else min(current,
+        // checkpoint).
+        uint256 weight = effective;
+        if (wrapperCheckpointed[wrapper]) {
+            uint256 prev = wrapperWeightCheckpoint[wrapper];
+            weight = effective < prev ? effective : prev;
+        }
+        wrapperSlice = (partnerCut * weight) / totalSupply_;
     }
 
     function unrecordedBalance() public view override returns (uint256) {
@@ -221,11 +300,30 @@ contract PartnerAttributedSplitter is AccessControl, ReentrancyGuard, IPartnerAt
         partnerShareBps = newBps;
     }
 
+    /// @notice F-6: propose a project-treasury change. It does NOT take effect
+    /// immediately — `applyProjectTreasury` commits it after TREASURY_TIMELOCK,
+    /// giving the current treasury time to `claimProject` what is already
+    /// accrued before the destination moves. Re-proposing overwrites the
+    /// pending target and restarts the clock.
     function setProjectTreasury(address newTreasury) external override onlyRole(ADMIN_ROLE) {
         if (newTreasury == address(0)) revert ZeroAddress();
+        pendingProjectTreasury = newTreasury;
+        pendingProjectTreasuryReadyAt = uint64(block.timestamp + TREASURY_TIMELOCK);
+        emit ProjectTreasuryProposed(newTreasury, pendingProjectTreasuryReadyAt);
+    }
+
+    /// @notice F-6: commit a previously proposed project-treasury change once
+    /// the timelock has elapsed.
+    function applyProjectTreasury() external onlyRole(ADMIN_ROLE) {
+        address next = pendingProjectTreasury;
+        if (next == address(0)) revert NoPendingTreasury();
+        uint64 readyAt = pendingProjectTreasuryReadyAt;
+        if (block.timestamp < readyAt) revert TreasuryTimelockNotElapsed(readyAt);
         address old = projectTreasury;
-        projectTreasury = newTreasury;
-        emit ProjectTreasuryUpdated(old, newTreasury);
+        projectTreasury = next;
+        pendingProjectTreasury = address(0);
+        pendingProjectTreasuryReadyAt = 0;
+        emit ProjectTreasuryUpdated(old, next);
     }
 
     function recoverUnrecorded()

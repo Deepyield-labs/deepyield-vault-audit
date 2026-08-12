@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
+import {ForkBlock} from "./ForkBlock.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {DedicatedVaultMain} from "../src/DedicatedVaultMain.sol";
 import {DedicatedVaultStrategyAdapter} from "../src/DedicatedVaultStrategyAdapter.sol";
@@ -45,7 +46,7 @@ contract VaultBWiredLifecycleForkTest is Test {
     bool forkAvailable;
 
     function setUp() public {
-        try this._fork() {} catch { forkAvailable = false; emit log("VaultBWiredLifecycleFork: no BSC fork - skip"); return; }
+        if (!ForkBlock.selectBscFork(vm)) return;
         forkAvailable = NFPM.code.length > 0 && MASTERCHEF.code.length > 0 && SWAP_ROUTER.code.length > 0;
         if (!forkAvailable) return;
 
@@ -76,12 +77,6 @@ contract VaultBWiredLifecycleForkTest is Test {
 
         bytes32 gr = main.GUARDIAN_ROLE();
         vm.prank(admin); main.grantRole(gr, address(strat));
-    }
-    function _fork() external {
-        require(msg.sender == address(this), "internal");
-        string memory rpc = vm.envOr("BSC_FORK_RPC", vm.rpcUrl("bsc"));
-        uint256 pin = vm.envOr("BSC_FORK_BLOCK", uint256(0));
-        if (pin == 0) vm.createSelectFork(rpc); else vm.createSelectFork(rpc, pin);
     }
     modifier whenFork() { if (!forkAvailable) { emit log("skip: no fork"); return; } _; }
 

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
+import {ForkBlock} from "./ForkBlock.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {PancakeV3SwapAdapter, ISmartRouterV3} from "../src/PancakeV3SwapAdapter.sol";
 
@@ -26,14 +27,8 @@ contract VaultBSwapAdapterForkTest is Test {
     bool forkAvailable;
 
     function setUp() public {
-        try this._fork() {} catch { forkAvailable = false; emit log("VaultBSwapAdapterFork: no BSC fork - skip"); return; }
+        if (!ForkBlock.selectBscFork(vm)) return;
         forkAvailable = USDT.code.length > 0 && V3_SWAP_ROUTER.code.length > 0;
-    }
-    function _fork() external {
-        require(msg.sender == address(this), "internal");
-        string memory rpc = vm.envOr("BSC_FORK_RPC", vm.rpcUrl("bsc"));
-        uint256 pin = vm.envOr("BSC_FORK_BLOCK", uint256(0));
-        if (pin == 0) vm.createSelectFork(rpc); else vm.createSelectFork(rpc, pin);
     }
     modifier whenFork() { if (!forkAvailable) { emit log("skip: no fork"); return; } _; }
 

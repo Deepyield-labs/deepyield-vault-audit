@@ -46,6 +46,10 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
         vault = vault_;
     }
 
+    function depositAssetSource() external view returns (address) {
+        return address(this);
+    }
+
     function setManaged(uint256 value) external {
         managed = value;
     }
@@ -66,6 +70,10 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
     function panic() external {}
 
     function estimatedTotalAssets() external view returns (uint256) {
+        return managed;
+    }
+
+    function estimatedTotalAssetsUpper() external view returns (uint256) {
         return managed;
     }
     function requestWithdrawal(bytes32, uint256) external {}
@@ -185,6 +193,13 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
             executor.bindMain(address(main));
             rewardExecutor.bindMain(address(main));
             venue.bindController(address(main));
+            vm.mockCall(
+                0x172fcD41E0913e95784454622d1c3724f546f849,
+                abi.encodeWithSignature("slot0()"),
+                abi.encode(
+                    uint160(0x1000000000000000000000000), int24(0), uint16(0), uint16(0), uint16(0), uint32(0), true
+                )
+            );
             usdt.mint(address(executor), 100_000e18);
             usdt.mint(address(rewardExecutor), 100_000e18);
             wbnb.mint(address(executor), 100_000e18);
@@ -301,7 +316,7 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
             vault.claimRedeem(requestId);
         }
 
-        function testOnePendingRequestPerOwnerAndMinimumSizePreventQueueSpam() public {
+        function testSameOwnerReceiverAggregatesAndMinimumSizePreventsQueueSpam() public {
             uint256 shares = _depositAndDeploy(alice, 1_000e18);
             uint256 minimum = vault.MIN_REDEEM_SHARES();
 
@@ -311,11 +326,16 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
 
             vm.prank(alice);
             uint256 requestId = vault.requestRedeem(minimum, alice, alice);
+            // B11-T4: a repeat (owner, receiver) aggregates into the same slot instead
+            // of reverting — shares sum, the slot count stays at one.
             vm.prank(alice);
-            vm.expectPartialRevert(DeepYieldVaultB.PendingRequestExists.selector);
-            vault.requestRedeem(minimum, alice, alice);
-            assertEq(vault.pendingRequestPlusOne(alice), requestId + 1);
-            assertEq(vault.balanceOf(alice), shares - minimum);
+            uint256 sameId = vault.requestRedeem(minimum, alice, alice);
+            assertEq(sameId, requestId, "same (owner,receiver) reuses the slot");
+            assertEq(vault.pendingRedeemKeyPlusOne(keccak256(abi.encode(alice, alice))), requestId + 1);
+            assertEq(vault.outstandingRedeemCount(), 1, "one slot for the pair");
+            (,, uint128 aggShares,,,) = vault.redeemRequests(requestId);
+            assertEq(uint256(aggShares), 2 * minimum, "shares aggregated");
+            assertEq(vault.balanceOf(alice), shares - 2 * minimum);
         }
 
         function testReceiverCanBeUpdatedAndOnlyOwnerCanCancelBeforeCommit() public {
@@ -346,7 +366,7 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
         function testPendingQueueHasHardSybilBound() public {
             uint256 shares = _depositAndDeploy(alice, 1_000e18);
             uint256 minimum = vault.MIN_REDEEM_SHARES();
-            uint256 limit = vault.MAX_PENDING_REDEEMS();
+            uint256 limit = vault.maxPendingRedeems();
             assertGt(shares, minimum * (limit + 1));
 
             for (uint256 i; i < limit; ++i) {
@@ -358,12 +378,13 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
             }
             assertEq(vault.outstandingRedeemCount(), limit);
             assertEq(main.queuedWithdrawalCount(), limit);
+            assertTrue(vault.redeemCycleCommitted(), "full queue is atomically committed");
 
             address overflow = address(uint160(20_000));
             vm.prank(alice);
             vault.transfer(overflow, minimum);
             vm.prank(overflow);
-            vm.expectRevert(DeepYieldVaultB.RedeemQueueFull.selector);
+            vm.expectRevert(DeepYieldVaultB.RedeemCycleLocked.selector);
             vault.requestRedeem(minimum, overflow, overflow);
         }
 
@@ -422,8 +443,12 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
             uint256 supplyBefore = vault.totalSupply();
             uint256 userSharesBefore = vault.balanceOf(alice);
             uint256 navBefore = vault.totalAssets();
+            // B3-T2: changing an existing strategy is now timelocked (propose/apply).
             vm.prank(admin);
-            vault.setStrategy(address(destination));
+            vault.proposeStrategy(address(destination));
+            vm.warp(block.timestamp + vault.STRATEGY_TIMELOCK());
+            vm.prank(admin);
+            vault.applyStrategy();
 
             assertEq(vault.totalSupply(), supplyBefore);
             assertEq(vault.balanceOf(alice), userSharesBefore);
@@ -431,19 +456,24 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
             assertEq(shares, userSharesBefore);
         }
 
+        // B3-T2: wrong wiring is rejected at propose; a non-empty current strategy
+        // is rejected at apply. (Named in the B3-T2 report.)
         function testStrategyCutoverRejectsNonEmptyCurrentAndWrongDestinationWiring() public {
             _depositAndDeploy(alice, 1_000e18);
             MockAsyncDestinationStrategy destination = new MockAsyncDestinationStrategy(IERC20(USDT), address(vault));
             vm.prank(admin);
+            vault.proposeStrategy(address(destination));
+            vm.warp(block.timestamp + vault.STRATEGY_TIMELOCK());
+            vm.prank(admin);
             vm.expectRevert(DeepYieldVaultB.StrategyNotEmpty.selector);
-            vault.setStrategy(address(destination));
+            vault.applyStrategy();
 
             vm.prank(manager);
             adapter.managerWithdrawAll();
             MockAsyncDestinationStrategy wrong = new MockAsyncDestinationStrategy(IERC20(USDT), bob);
             vm.prank(admin);
             vm.expectRevert(DeepYieldVaultB.StrategyWiringMismatch.selector);
-            vault.setStrategy(address(wrong));
+            vault.proposeStrategy(address(wrong));
         }
 
         function _depositAndDeploy(address user, uint256 assets) internal returns (uint256 shares) {
@@ -469,6 +499,10 @@ contract MockAsyncDestinationStrategy is IVaultBAsyncStrategy {
             uint256 swapIn = budget / 2;
             uint256 assetForMint = budget - swapIn;
             bytes32 jobId = keccak256(abi.encode("OPEN", ++jobNonce));
+            vm.prank(keeper);
+            main.reserveOpenSeries(jobId, budget, swapIn, -100, 100, block.timestamp + 60); // B11-T1
+            vm.prank(keeper);
+            main.openSwapChunk(jobId, 0, swapIn, 1, block.timestamp + 60); // B8-T1 swap phase
             vm.prank(keeper);
             main.openPosition(
                 DedicatedVaultMainV2.OpenParams({

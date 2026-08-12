@@ -981,7 +981,7 @@ interface IV3PoolVenue {
 /// arbitrary recipient. Implements `ERC721Holder` so a Masterchef `safeTransferFrom`
 /// unstake is received. NAV via the audited `V3PositionValuer` (conservative).
 ///
-/// @dev Hardening (Codex QA on 7dd0b4c): ERC721 receiver ✓, reward-token sweep ✓,
+/// @dev Hardening (internal QA on 7dd0b4c): ERC721 receiver ✓, reward-token sweep ✓,
 /// slippage/deadline on open/close ✓, idle-paired returned to controller (Main realizes
 /// it to USDT before redeem). `open()` is now TWO-SIDED (USDT+WBNB; Main pre-swaps the
 /// WBNB leg) — the proven fork finding (test/VaultBLifecycleFork.t.sol) showed single-sided

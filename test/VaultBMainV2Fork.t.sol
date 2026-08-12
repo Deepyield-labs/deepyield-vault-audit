@@ -2,11 +2,13 @@
 pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ForkBlock} from "./ForkBlock.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {BoundedPancakeExecutionAdapterV2} from "../src/BoundedPancakeExecutionAdapterV2.sol";
 import {BoundedPancakeRewardAdapterV2} from "../src/BoundedPancakeRewardAdapterV2.sol";
 import {DedicatedVaultMainV2} from "../src/DedicatedVaultMainV2.sol";
+import {JobKind, JobStatus, Job} from "../src/libraries/MainV2Jobs.sol";
 import {
     IMasterchefVenue,
     INfpmVenue,
@@ -42,13 +44,19 @@ contract VaultBMainV2ForkTest is Test {
     DedicatedVaultMainV2 internal main;
 
     function setUp() public {
-        vm.createSelectFork(vm.rpcUrl("bsc"));
-        guard = new VaultBPriceGuard(100, 1_000, 500, 1_800, 3_600, 90_000, 600, admin, guardian);
+        // Pin the fork block, or cleanly skip if the RPC can't serve it (see ForkBlock).
+        if (!ForkBlock.selectBscFork(vm)) return;
+        guard = new VaultBPriceGuard(100, 1_000, 500, 1_000, 1_800, 3_600, 90_000, 600, admin, guardian);
         executor = new BoundedPancakeExecutionAdapterV2(address(this), IVaultBPriceGuard(address(guard)), 120);
-        rewardGuard =
-            new VaultBCakePriceGuard(100, 1_000, 500, 5_100e18, 50_000e18, 1_800, 3_600, 90_000, 600, admin, guardian);
+        rewardGuard = new VaultBCakePriceGuard(
+            100, 1_000, 500, 1_000, 5_100e18, 50_000e18, 1_800, 3_600, 90_000, 600, admin, guardian
+        );
         rewardExecutor =
             new BoundedPancakeRewardAdapterV2(address(this), IVaultBRewardPriceGuard(address(rewardGuard)), 120);
+        vm.startPrank(admin);
+        guard.grantRole(guard.EMERGENCY_CONSUMER_ROLE(), address(executor));
+        rewardGuard.grantRole(rewardGuard.EMERGENCY_CONSUMER_ROLE(), address(rewardExecutor));
+        vm.stopPrank();
 
         uint256 base = vm.getNonce(address(this));
         address predictedMain = vm.computeCreateAddress(address(this), base + 1);
@@ -126,12 +134,12 @@ contract VaultBMainV2ForkTest is Test {
         assertEq(IERC20(USDT).balanceOf(address(this)) - before, 900e18);
         assertFalse(main.withdrawalCycleCommitted());
 
-        (, DedicatedVaultMainV2.JobStatus openStatus,,,,,,) = main.jobs(keccak256("fork-main-v2-open"));
-        (, DedicatedVaultMainV2.JobStatus closeStatus,,,,,,) = main.jobs(closeJob);
-        (, DedicatedVaultMainV2.JobStatus sellStatus,,,,,,) = main.jobs(sellJob);
-        assertEq(uint256(openStatus), uint256(DedicatedVaultMainV2.JobStatus.COMPLETED));
-        assertEq(uint256(closeStatus), uint256(DedicatedVaultMainV2.JobStatus.COMPLETED));
-        assertEq(uint256(sellStatus), uint256(DedicatedVaultMainV2.JobStatus.COMPLETED));
+        (, JobStatus openStatus,,,,,,) = main.jobs(keccak256("fork-main-v2-open"));
+        (, JobStatus closeStatus,,,,,,) = main.jobs(closeJob);
+        (, JobStatus sellStatus,,,,,,) = main.jobs(sellJob);
+        assertEq(uint256(openStatus), uint256(JobStatus.COMPLETED));
+        assertEq(uint256(closeStatus), uint256(JobStatus.COMPLETED));
+        assertEq(uint256(sellStatus), uint256(JobStatus.COMPLETED));
 
         assertGt(positionId, 0);
     }
@@ -179,7 +187,7 @@ contract VaultBMainV2ForkTest is Test {
         main.liquidateAllReward(keccak256("fork-main-v2-cake-large-normal"), 0, 1, block.timestamp + 60, true, false);
 
         vm.prank(guardian);
-        rewardGuard.activateEmergencyBudget(300, uint64(block.timestamp + 300));
+        rewardGuard.activateEmergencyBudget(300, uint64(block.timestamp + 300), 50_000e18);
         uint256 emergencyMin = rewardGuard.minimumOut(largeAmountIn, true);
         vm.prank(guardian);
         uint256 emergencyOut = main.liquidateAllReward(
@@ -214,6 +222,14 @@ contract VaultBMainV2ForkTest is Test {
         (, int24 tick,,,,,) = IVaultBPoolForkV2(POOL).slot0();
         int24 spacing = IVaultBPoolForkV2(POOL).tickSpacing();
         int24 center = (tick / spacing) * spacing;
+        // B8-T1: the open is two-phase — swap the paired leg via openSwapChunk, then
+        // mint from the accumulated inventory. openSwapChunk fixes the series (B9-T1).
+        vm.prank(keeper);
+        main.reserveOpenSeries(
+            openJob, 1_000e18, 500e18, center - 70 * spacing, center + 70 * spacing, block.timestamp + 60
+        ); // B11-T1
+        vm.prank(keeper);
+        main.openSwapChunk(openJob, 0, 500e18, 1, block.timestamp + 60);
         vm.prank(keeper);
         positionId = main.openPosition(
             DedicatedVaultMainV2.OpenParams({

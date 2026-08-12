@@ -57,6 +57,12 @@ contract VaultBProductionWiringTest is Test {
     }
     function _fork() external {
         require(msg.sender == address(this), "internal");
+        // INTENTIONALLY UNPINNED by default (T-T1): this suite asserts the LIVE prod
+        // wiring (which adapter is swapperIn/swapper/rewardSwapper, roles), not
+        // block-sensitive arithmetic, and it runs in the default (non-archive) suite —
+        // a pinned historical block would fail there with `missing trie node`. Wiring
+        // asserts are block-invariant, so latest is deterministic. Override
+        // BSC_FORK_BLOCK (needs an archive BSC_FORK_RPC) only to deliberately pin it.
         string memory rpc = vm.envOr("BSC_FORK_RPC", vm.rpcUrl("bsc"));
         uint256 pin = vm.envOr("BSC_FORK_BLOCK", uint256(0));
         if (pin == 0) vm.createSelectFork(rpc); else vm.createSelectFork(rpc, pin);

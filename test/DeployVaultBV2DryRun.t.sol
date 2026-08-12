@@ -10,6 +10,8 @@ import {DedicatedVaultMainV2} from "../src/DedicatedVaultMainV2.sol";
 import {DedicatedVaultStrategyAdapterV2} from "../src/DedicatedVaultStrategyAdapterV2.sol";
 import {BoundedPancakeExecutionAdapterV2} from "../src/BoundedPancakeExecutionAdapterV2.sol";
 import {BoundedPancakeRewardAdapterV2} from "../src/BoundedPancakeRewardAdapterV2.sol";
+import {VaultBPriceGuard} from "../src/VaultBPriceGuard.sol";
+import {VaultBCakePriceGuard} from "../src/VaultBCakePriceGuard.sol";
 import {PancakeV3MasterchefVenue} from "../src/PancakeV3MasterchefVenue.sol";
 import {PartnerRegistry} from "../src/partners/PartnerRegistry.sol";
 import {PartnerAttributedSplitter} from "../src/partners/PartnerAttributedSplitter.sol";
@@ -22,7 +24,16 @@ contract DeployVaultBV2DryRunTest is Test {
     DeployVaultBV2.Addresses internal deployed;
 
     function setUp() public {
-        vm.createSelectFork(vm.rpcUrl("bsc"));
+        // INTENTIONALLY UNPINNED by default (T-T1): this suite asserts the LIVE V2
+        // deploy wiring (asset/strategy/adapter), not block-sensitive arithmetic, and
+        // it runs in the default (non-archive) suite — a pinned historical block would
+        // fail there with `missing trie node`. Wiring asserts are block-invariant, so
+        // latest is deterministic. Override BSC_FORK_BLOCK (needs an archive
+        // BSC_FORK_RPC) only to deliberately pin it.
+        string memory rpc = vm.envOr("BSC_FORK_RPC", vm.rpcUrl("bsc"));
+        uint256 pin = vm.envOr("BSC_FORK_BLOCK", uint256(0));
+        if (pin == 0) vm.createSelectFork(rpc);
+        else vm.createSelectFork(rpc, pin);
         script = new DeployVaultBV2();
         cfg = DeployVaultBV2.Config({
             admin: address(script),
@@ -39,6 +50,7 @@ contract DeployVaultBV2DryRunTest is Test {
             normalSwapLossBps: 100,
             maxEmergencySwapLossBps: 1_000,
             maxOracleDeviationBps: 500,
+            maxEmergencyOracleDeviationBps: 1_000,
             mintLossBps: 100,
             normalCloseLossBps: 100,
             emergencyCloseLossBps: 1_000,
@@ -65,6 +77,8 @@ contract DeployVaultBV2DryRunTest is Test {
         DedicatedVaultStrategyAdapterV2 adapter = DedicatedVaultStrategyAdapterV2(deployed.adapter);
         BoundedPancakeExecutionAdapterV2 wbnbExecutor = BoundedPancakeExecutionAdapterV2(deployed.wbnbExecutor);
         BoundedPancakeRewardAdapterV2 cakeExecutor = BoundedPancakeRewardAdapterV2(deployed.cakeExecutor);
+        VaultBPriceGuard wbnbGuard = VaultBPriceGuard(deployed.wbnbGuard);
+        VaultBCakePriceGuard cakeGuard = VaultBCakePriceGuard(deployed.cakeGuard);
         PancakeV3MasterchefVenue venue = PancakeV3MasterchefVenue(deployed.venue);
 
         assertEq(vault.asset(), USDT);
@@ -77,6 +91,8 @@ contract DeployVaultBV2DryRunTest is Test {
         assertEq(venue.controller(), address(main));
         assertEq(wbnbExecutor.main(), address(main));
         assertEq(cakeExecutor.main(), address(main));
+        assertTrue(wbnbGuard.hasRole(wbnbGuard.EMERGENCY_CONSUMER_ROLE(), address(wbnbExecutor)));
+        assertTrue(cakeGuard.hasRole(cakeGuard.EMERGENCY_CONSUMER_ROLE(), address(cakeExecutor)));
         assertEq(uint256(main.mode()), uint256(DedicatedVaultMainV2.Mode.HALTED));
         assertEq(vault.maxDeposit(address(this)), 0, "halted deployment cannot accept capital");
         assertEq(main.canaryOpenCap(), 500e18);
@@ -90,6 +106,8 @@ contract DeployVaultBV2DryRunTest is Test {
         DedicatedVaultStrategyAdapterV2 adapter = DedicatedVaultStrategyAdapterV2(deployed.adapter);
 
         assertEq(registry.vault(), deployed.vault);
+        assertEq(registry.factory(), address(0), "wrapper factory is intentionally outside the V2 graph");
+        assertEq(registry.activeWrapperCount(), 0, "no wrapper may be active in the audited V2 graph");
         assertEq(splitter.registry(), deployed.registry);
         assertEq(splitter.vault(), deployed.vault);
         assertEq(adapter.feeRecipient(), deployed.splitter);

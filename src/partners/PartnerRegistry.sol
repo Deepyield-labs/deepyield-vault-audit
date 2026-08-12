@@ -53,6 +53,20 @@ contract PartnerRegistry is AccessControl, IPartnerRegistry {
     mapping(bytes32 => address) public override payoutTreasury;
     mapping(bytes32 => address[]) private _wrappersOfPartner;
 
+    // ── F-6: timelocked partner-payout-treasury change ──
+    /// @dev Changing a partner's payout treasury is proposed, then applied after
+    /// PARTNER_TREASURY_TIMELOCK, so the partner can `claimWrapper` what is
+    /// already accrued to the old address before payouts move. The initial
+    /// treasury is still set instantly at registration (bootstrap).
+    uint256 public constant PARTNER_TREASURY_TIMELOCK = 2 days;
+    mapping(bytes32 => address) public pendingPartnerTreasury;
+    mapping(bytes32 => uint64)  public pendingPartnerTreasuryReadyAt;
+
+    event PartnerTreasuryProposed(bytes32 indexed partnerId, address indexed newTreasury, uint64 readyAt);
+
+    error NoPendingPartnerTreasury();
+    error PartnerTreasuryTimelockNotElapsed(uint64 readyAt);
+
     // ── per-wrapper state ──
 
     mapping(address => bytes32) public override partnerOfWrapper;
@@ -211,6 +225,11 @@ contract PartnerRegistry is AccessControl, IPartnerRegistry {
     // admin-only
     // ──────────────────────────────────────────────────────────────────
 
+    /// @notice F-6: propose a partner payout-treasury change. It does NOT take
+    /// effect immediately — `applyPartnerTreasury` commits it after
+    /// PARTNER_TREASURY_TIMELOCK, so the partner can `claimWrapper` what is
+    /// already accrued to the old address before payouts move. Re-proposing
+    /// overwrites the pending target and restarts the clock.
     function updatePartnerTreasury(bytes32 partnerId, address newTreasury)
         external
         override
@@ -218,9 +237,24 @@ contract PartnerRegistry is AccessControl, IPartnerRegistry {
     {
         if (newTreasury == address(0)) revert ZeroAddress();
         if (currentWrapperOf[partnerId] == address(0)) revert PartnerNotRegistered();
+        pendingPartnerTreasury[partnerId] = newTreasury;
+        uint64 readyAt = uint64(block.timestamp + PARTNER_TREASURY_TIMELOCK);
+        pendingPartnerTreasuryReadyAt[partnerId] = readyAt;
+        emit PartnerTreasuryProposed(partnerId, newTreasury, readyAt);
+    }
+
+    /// @notice F-6: commit a previously proposed partner payout-treasury change
+    /// once the timelock has elapsed.
+    function applyPartnerTreasury(bytes32 partnerId) external onlyRole(ADMIN_ROLE) {
+        address next = pendingPartnerTreasury[partnerId];
+        if (next == address(0)) revert NoPendingPartnerTreasury();
+        uint64 readyAt = pendingPartnerTreasuryReadyAt[partnerId];
+        if (block.timestamp < readyAt) revert PartnerTreasuryTimelockNotElapsed(readyAt);
         address old = payoutTreasury[partnerId];
-        payoutTreasury[partnerId] = newTreasury;
-        emit PartnerTreasuryUpdated(partnerId, old, newTreasury);
+        payoutTreasury[partnerId] = next;
+        pendingPartnerTreasury[partnerId] = address(0);
+        pendingPartnerTreasuryReadyAt[partnerId] = 0;
+        emit PartnerTreasuryUpdated(partnerId, old, next);
     }
 
     function pauseDepositsForWrapper(address wrapper) external override onlyRole(ADMIN_ROLE) {

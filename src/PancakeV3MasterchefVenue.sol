@@ -65,10 +65,15 @@ interface IMasterchefVenue {
         uint128 amount1Max;
     }
     function collect(CollectParams calldata p) external returns (uint256 amount0, uint256 amount1);
+    /// @dev MasterChefV3 pool -> pid registry; 0 means the pool is not farmed here.
+    function v3PoolAddressPid(address pool) external view returns (uint256 pid);
 }
 
 interface IV3PoolVenue {
     function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint32, bool);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function fee() external view returns (uint24);
 }
 
 /// @title PancakeV3MasterchefVenue (PROTOTYPE — no funds / not deployed)
@@ -78,7 +83,7 @@ interface IV3PoolVenue {
 /// arbitrary recipient. Implements `ERC721Holder` so a Masterchef `safeTransferFrom`
 /// unstake is received. NAV via the audited `V3PositionValuer` (conservative).
 ///
-/// @dev Hardening (Codex QA on 7dd0b4c): ERC721 receiver ✓, reward-token sweep ✓,
+/// @dev Hardening (internal QA on 7dd0b4c): ERC721 receiver ✓, reward-token sweep ✓,
 /// slippage/deadline on open/close ✓, idle-paired returned to controller (Main realizes
 /// it to USDT before redeem). `open()` is now TWO-SIDED (USDT+WBNB; Main pre-swaps the
 /// WBNB leg) — the proven fork finding (test/VaultBLifecycleFork.t.sol) showed single-sided
@@ -101,11 +106,43 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
     uint256 public activeTokenId; // 0 = none
     bool public activeStaked;
 
+    /// @notice How far a (possibly interrupted) close has progressed. `close()`
+    /// is a chain of six external calls; a revert on any one used to roll back the
+    /// whole thing while `activeTokenId` stayed set, permanently blocking `open()`.
+    /// This marker persists progress so the close can resume stage-by-stage from
+    /// where it failed instead of restarting and hitting the same wall.
+    enum CloseStage {
+        NONE, // nothing started (fresh position) or reset after burn
+        UNSTAKED, // masterchef unstake done (NFT at venue, activeStaked=false)
+        DECREASED, // liquidity removed
+        COLLECTED // tokens/fees collected; only burn remains
+    }
+
+    CloseStage public closeStage;
+
+    /// @notice Last position deliberately written off because its close could not
+    /// complete (e.g. masterchef reward path permanently broken, so even
+    /// `withdraw()` reverts — verified: PancakeSwap MasterChefV3.withdraw settles
+    /// pending CAKE before releasing the NFT). Recorded so a stranded NFT is never
+    /// lost from accounting even though the venue is freed to open a new position.
+    uint256 public strandedTokenId;
+    bool public strandedWasStaked; // true = still owned by masterchef, unrecoverable via withdraw
+
     error OnlyController();
     error PositionActive();
     error NoActivePosition();
     error RewardTokenRequired();
     error ForceUnstakeUnavailable();
+    error ZeroAddress();
+    error NotContract(address account);
+    error PoolTokenMismatch(address expectedToken0, address expectedToken1, address actualToken0, address actualToken1);
+    error PoolFeeMismatch(uint24 expected, uint24 actual);
+    error MasterchefPoolUnknown(address pool);
+    error CloseStageMismatch(uint8 expected, uint8 actual);
+
+    event CloseStageAdvanced(uint256 indexed tokenId, uint8 stage);
+    event PositionClosed(uint256 indexed tokenId);
+    event PositionStranded(uint256 indexed tokenId, bool wasStaked, address custody);
 
     modifier onlyController() {
         if (msg.sender != controller) revert OnlyController();
@@ -122,6 +159,38 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
         IMasterchefVenue masterchef_,
         IERC20 rewardToken_
     ) {
+        bool farmed_ = address(masterchef_) != address(0);
+        // farmed venues MUST declare the reward token, else CAKE handling is silently skipped
+        if (farmed_ && address(rewardToken_) == address(0)) revert RewardTokenRequired();
+
+        // Non-zero required for every dependency. `controller_` is the Main, whose
+        // address is CREATE-predicted and deployed AFTER this venue, so it has no
+        // code yet here — check its address is set but NOT its code.
+        if (
+            controller_ == address(0) || address(asset_) == address(0) || address(paired_) == address(0)
+                || address(pool_) == address(0) || address(nfpm_) == address(0)
+        ) revert ZeroAddress();
+
+        // The external integration contracts we actually call must be contracts.
+        _requireContract(address(pool_));
+        _requireContract(address(nfpm_));
+
+        // token0/token1 order underpins the entire price math (asset == token0);
+        // a swapped pool would silently value everything wrong instead of reverting.
+        address t0 = pool_.token0();
+        address t1 = pool_.token1();
+        if (t0 != address(asset_) || t1 != address(paired_)) {
+            revert PoolTokenMismatch(address(asset_), address(paired_), t0, t1);
+        }
+        uint24 poolFee = pool_.fee();
+        if (poolFee != fee_) revert PoolFeeMismatch(fee_, poolFee);
+
+        if (farmed_) {
+            _requireContract(address(masterchef_));
+            // The masterchef must actually farm this pool, else staking is misdirected.
+            if (masterchef_.v3PoolAddressPid(address(pool_)) == 0) revert MasterchefPoolUnknown(address(pool_));
+        }
+
         controller = controller_;
         asset = asset_;
         paired = paired_;
@@ -130,9 +199,11 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
         nfpm = nfpm_;
         masterchef = masterchef_;
         rewardToken = rewardToken_;
-        farmed = address(masterchef_) != address(0);
-        // farmed venues MUST declare the reward token, else CAKE handling is silently skipped
-        if (farmed && address(rewardToken_) == address(0)) revert RewardTokenRequired();
+        farmed = farmed_;
+    }
+
+    function _requireContract(address account) private view {
+        if (account.code.length == 0) revert NotContract(account);
     }
 
     /// @notice Two-sided mint from `assetAmount` USDT + `pairedAmount` WBNB pulled from the
@@ -172,18 +243,108 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
         _returnAllToController();
     }
 
-    /// @notice Full-close: unstake (+harvest), remove all liquidity (bounded), collect,
-    /// burn, return ALL (asset/paired/reward) to controller.
+    /// @notice Full-close in one call: unstake (+harvest), remove all liquidity
+    /// (bounded), collect, burn, return ALL (asset/paired/reward) to controller.
+    /// Resumable: it advances only the stages not yet done, so a call after a
+    /// partial staged close (below) finishes the remainder rather than replaying —
+    /// and a fresh call from `NONE` behaves exactly as the original full close.
     function close(uint256 positionId, uint256 amount0Min, uint256 amount1Min, uint256 deadline)
         external
         onlyController
     {
+        _requireActive(positionId);
+        if (uint8(closeStage) < uint8(CloseStage.UNSTAKED)) _unstakeStage(positionId);
+        if (uint8(closeStage) < uint8(CloseStage.DECREASED)) _decreaseStage(positionId, amount0Min, amount1Min, deadline);
+        if (uint8(closeStage) < uint8(CloseStage.COLLECTED)) _collectStage(positionId);
+        _burnStage(positionId);
+    }
+
+    /// @notice Resumable close, one stage per call, driven by the controller.
+    /// Each stage commits its progress to storage in its own transaction, so a
+    /// revert on a later stage never undoes an earlier one: a retry continues from
+    /// the failed stage instead of restarting the whole chain. Ordering is enforced
+    /// by `closeStage`; the stages are unstake → decrease → collect → burn.
+    function closeUnstake(uint256 positionId) external onlyController {
+        _requireActive(positionId);
+        _requireStage(CloseStage.NONE);
+        _unstakeStage(positionId);
+    }
+
+    function closeDecrease(uint256 positionId, uint256 amount0Min, uint256 amount1Min, uint256 deadline)
+        external
+        onlyController
+    {
+        _requireActive(positionId);
+        _requireStage(CloseStage.UNSTAKED);
+        _decreaseStage(positionId, amount0Min, amount1Min, deadline);
+    }
+
+    function closeCollect(uint256 positionId) external onlyController {
+        _requireActive(positionId);
+        _requireStage(CloseStage.DECREASED);
+        _collectStage(positionId);
+    }
+
+    function closeBurn(uint256 positionId) external onlyController {
+        _requireActive(positionId);
+        _requireStage(CloseStage.COLLECTED);
+        _burnStage(positionId);
+    }
+
+    /// @notice Deliberately abandon a position whose close cannot complete, so one
+    /// stuck NFT cannot block the venue from ever opening again. The NFT is NOT
+    /// discarded: if it is already back at the venue it is handed to the controller
+    /// (the venue's only permitted recipient — an outsider can never receive it),
+    /// and if it is still staked in a broken masterchef (where `withdraw` reverts)
+    /// it stays there, recorded on-chain for manual recovery. Either way the id is
+    /// retained in `strandedTokenId` and surfaced via `PositionStranded`, and the
+    /// venue is freed. Controller-only; the controller enforces the narrower
+    /// guardian gate for this most dangerous primitive.
+    function writeOffStrandedPosition() external onlyController returns (uint256 strandedId) {
+        strandedId = activeTokenId;
+        if (strandedId == 0) revert NoActivePosition();
+        bool wasStaked = activeStaked;
+
+        // Record before freeing the slot so the position never leaves accounting.
+        strandedTokenId = strandedId;
+        strandedWasStaked = wasStaked;
+
+        address custody;
+        if (wasStaked) {
+            // NFT is owned by the (broken) masterchef and cannot be moved here;
+            // leave it there, tracked, for later manual recovery.
+            custody = address(masterchef);
+        } else {
+            // NFT is at the venue: return it to the controller — never a third party.
+            custody = controller;
+            nfpm.safeTransferFrom(address(this), controller, strandedId);
+        }
+
+        activeTokenId = 0;
+        activeStaked = false;
+        closeStage = CloseStage.NONE;
+        emit PositionStranded(strandedId, wasStaked, custody);
+    }
+
+    function _requireActive(uint256 positionId) internal view {
         if (positionId == 0 || positionId != activeTokenId) revert NoActivePosition();
+    }
+
+    function _requireStage(CloseStage expected) internal view {
+        if (closeStage != expected) revert CloseStageMismatch(uint8(expected), uint8(closeStage));
+    }
+
+    function _unstakeStage(uint256 positionId) internal {
         if (activeStaked) {
             masterchef.harvest(positionId, address(this));
             masterchef.withdraw(positionId, address(this)); // NFT back to venue (ERC721Holder receives)
             activeStaked = false;
         }
+        closeStage = CloseStage.UNSTAKED;
+        emit CloseStageAdvanced(positionId, uint8(CloseStage.UNSTAKED));
+    }
+
+    function _decreaseStage(uint256 positionId, uint256 amount0Min, uint256 amount1Min, uint256 deadline) internal {
         (,,,,,,, uint128 liq,,,,) = nfpm.positions(positionId);
         if (liq > 0) {
             nfpm.decreaseLiquidity(
@@ -196,6 +357,11 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
                 })
             );
         }
+        closeStage = CloseStage.DECREASED;
+        emit CloseStageAdvanced(positionId, uint8(CloseStage.DECREASED));
+    }
+
+    function _collectStage(uint256 positionId) internal {
         nfpm.collect(
             INfpmVenue.CollectParams({
                 tokenId: positionId,
@@ -204,9 +370,18 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
                 amount1Max: type(uint128).max
             })
         );
+        closeStage = CloseStage.COLLECTED;
+        _returnAllToController();
+        emit CloseStageAdvanced(positionId, uint8(CloseStage.COLLECTED));
+    }
+
+    function _burnStage(uint256 positionId) internal {
         nfpm.burn(positionId);
         activeTokenId = 0;
+        activeStaked = false;
+        closeStage = CloseStage.NONE;
         _returnAllToController();
+        emit PositionClosed(positionId);
     }
 
     /// @notice Collect fees (+ CAKE if farmed) to the controller. Returns asset collected.
@@ -215,6 +390,12 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
     /// (Proven by the wired fork test; mocks couldn't catch the ownership gate.)
     function harvest(uint256 positionId) external onlyController returns (uint256 assetCollected) {
         if (positionId == 0 || positionId != activeTokenId) revert NoActivePosition();
+        // Measure what this call actually pulls INTO the venue — collect always
+        // sends to address(this). Any asset sitting here beforehand is captured in
+        // the baseline, so a donation (to the venue or the controller) cannot be
+        // reported as harvested income, and a concurrent controller spend cannot
+        // deflate it. The old controller-balance delta was corruptible both ways.
+        uint256 collectedBefore = asset.balanceOf(address(this));
         if (activeStaked) {
             masterchef.harvest(positionId, address(this)); // CAKE
             masterchef.collect(
@@ -235,9 +416,8 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
                 })
             );
         }
-        uint256 before = asset.balanceOf(controller);
+        assetCollected = asset.balanceOf(address(this)) - collectedBefore;
         _returnAllToController();
-        assetCollected = asset.balanceOf(controller) - before;
     }
 
     /// @notice EMERGENCY ONLY. Forces unstake from masterchef WITHOUT harvest

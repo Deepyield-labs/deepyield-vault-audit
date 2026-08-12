@@ -10,6 +10,18 @@ interface IVaultBAsyncStrategy is IDeepYieldStrategy {
     function asset() external view returns (IERC20);
     function vault() external view returns (address);
 
+    /// @notice Address that directly holds the strategy's deposit-time asset
+    /// backing. The vault pins this address when the strategy is activated and
+    /// reads the ERC20 balance itself as an independent NAV floor.
+    function depositAssetSource() external view returns (address);
+
+    /// @notice Deposit-conservative estimate of strategy assets (B10-T2): the
+    /// upper (max TWAP/spot geometry) counterpart of `estimatedTotalAssets`, net of
+    /// pending performance fee. The vault prices deposits/mints on this so a spot
+    /// manipulation cannot under-value NAV; redemptions keep using the lower
+    /// `estimatedTotalAssets`.
+    function estimatedTotalAssetsUpper() external view returns (uint256);
+
     /// @dev `assetsHint` is observability only. The queued shares remain exposed
     /// to NAV until claim, so settlement uses the claim-time amount.
     function requestWithdrawal(bytes32 requestId, uint256 assetsHint) external;

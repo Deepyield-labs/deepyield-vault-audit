@@ -11,10 +11,19 @@ interface IChainlinkAggregatorV3 {
 }
 
 interface IVaultBPriceGuard {
+    function POOL_FEE() external view returns (uint24);
+
     function minimumOut(address tokenIn, address tokenOut, uint256 amountIn, bool emergency)
         external
         view
         returns (uint256 minOut);
+
+    function minimumOutAndBudget(address tokenIn, address tokenOut, uint256 amountIn, bool emergency)
+        external
+        view
+        returns (uint256 minOut, uint256 emergencyNotional, bool emergencyBudgetUsed);
+
+    function consumeEmergencyNotional(uint256 notional) external;
 
     function fairValue(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256 amountOut);
 
@@ -36,7 +45,16 @@ interface IVaultBExecutionAdapterV2 {
 }
 
 interface IVaultBRewardPriceGuard {
+    function DIRECT_ORACLE_FEE() external view returns (uint24);
+
     function minimumOut(uint256 amountIn, bool emergency) external view returns (uint256 minOut);
+
+    function minimumOutAndBudget(uint256 amountIn, bool emergency)
+        external
+        view
+        returns (uint256 minOut, uint256 emergencyNotional, bool emergencyBudgetUsed);
+
+    function consumeEmergencyNotional(uint256 notional) external;
 
     function fairValue(uint256 amountIn) external view returns (uint256 amountOut);
 }

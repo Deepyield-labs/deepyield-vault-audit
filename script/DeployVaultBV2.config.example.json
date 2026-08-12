@@ -16,6 +16,7 @@
   "normalSwapLossBps": 100,
   "maxEmergencySwapLossBps": 1000,
   "maxOracleDeviationBps": 500,
+  "maxEmergencyOracleDeviationBps": 1000,
   "mintLossBps": 100,
   "normalCloseLossBps": 100,
   "emergencyCloseLossBps": 1000,

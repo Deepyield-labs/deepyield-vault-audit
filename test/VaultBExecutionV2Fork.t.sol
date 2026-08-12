@@ -2,6 +2,7 @@
 pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ForkBlock} from "./ForkBlock.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {BoundedPancakeExecutionAdapterV2} from "../src/BoundedPancakeExecutionAdapterV2.sol";
@@ -17,11 +18,13 @@ contract VaultBExecutionV2ForkTest is Test {
     BoundedPancakeExecutionAdapterV2 internal adapter;
 
     function setUp() public {
-        vm.createSelectFork(vm.rpcUrl("bsc"));
+        // Pin the fork block, or cleanly skip if the RPC can't serve it (see ForkBlock).
+        if (!ForkBlock.selectBscFork(vm)) return;
         guard = new VaultBPriceGuard({
             normalLossBps_: 100,
             maxEmergencyLossBps_: 1_000,
             maxOracleDeviationBps_: 500,
+            maxEmergencyOracleDeviationBps_: 1_000,
             twapWindow_: 1_800,
             maxBnbFeedAge_: 3_600,
             maxUsdtFeedAge_: 90_000,

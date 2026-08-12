@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity =0.8.24 >=0.4.16 >=0.6.2 >=0.8.4 ^0.8.20 ^0.8.24;
+pragma solidity =0.8.24 >=0.4.16 >=0.5.0 >=0.6.2 >=0.8.4 ^0.8.20 ^0.8.24;
 
 // lib/openzeppelin-contracts/contracts/utils/Context.sol
 
@@ -64,29 +64,35 @@ library FullMath {
             prod0 := sub(prod0, remainder)
         }
 
-        uint256 twos = (~denominator + 1) & denominator;
-        assembly {
-            denominator := div(denominator, twos)
-        }
+        // The 512-bit path relies on wrapping (mod 2**256) arithmetic that is
+        // canonical under pre-0.8 Solidity; under ^0.8 it must be `unchecked`, or
+        // the intended overflows revert. The two require()s above stay outside as
+        // real reverts (they must not be silenced).
+        unchecked {
+            uint256 twos = (~denominator + 1) & denominator;
+            assembly {
+                denominator := div(denominator, twos)
+            }
 
-        assembly {
-            prod0 := div(prod0, twos)
-        }
-        assembly {
-            twos := add(div(sub(0, twos), twos), 1)
-        }
-        prod0 |= prod1 * twos;
+            assembly {
+                prod0 := div(prod0, twos)
+            }
+            assembly {
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+            prod0 |= prod1 * twos;
 
-        uint256 inv = (3 * denominator) ^ 2;
-        inv *= 2 - denominator * inv; // inverse mod 2**8
-        inv *= 2 - denominator * inv; // inverse mod 2**16
-        inv *= 2 - denominator * inv; // inverse mod 2**32
-        inv *= 2 - denominator * inv; // inverse mod 2**64
-        inv *= 2 - denominator * inv; // inverse mod 2**128
-        inv *= 2 - denominator * inv; // inverse mod 2**256
+            uint256 inv = (3 * denominator) ^ 2;
+            inv *= 2 - denominator * inv; // inverse mod 2**8
+            inv *= 2 - denominator * inv; // inverse mod 2**16
+            inv *= 2 - denominator * inv; // inverse mod 2**32
+            inv *= 2 - denominator * inv; // inverse mod 2**64
+            inv *= 2 - denominator * inv; // inverse mod 2**128
+            inv *= 2 - denominator * inv; // inverse mod 2**256
 
-        result = prod0 * inv;
-        return result;
+            result = prod0 * inv;
+            return result;
+        }
     }
 
     function mulDivRoundingUp(
@@ -304,6 +310,34 @@ interface IERC20 {
     function transferFrom(address from, address to, uint256 value) external returns (bool);
 }
 
+// lib/openzeppelin-contracts/contracts/token/ERC721/IERC721Receiver.sol
+
+// OpenZeppelin Contracts (last updated v5.4.0) (token/ERC721/IERC721Receiver.sol)
+
+/**
+ * @title ERC-721 token receiver interface
+ * @dev Interface for any contract that wants to support safeTransfers
+ * from ERC-721 asset contracts.
+ */
+interface IERC721Receiver {
+    /**
+     * @dev Whenever an {IERC721} `tokenId` token is transferred to this contract via {IERC721-safeTransferFrom}
+     * by `operator` from `from`, this function is called.
+     *
+     * It must return its Solidity selector to confirm the token transfer.
+     * If any other value is returned or the interface is not implemented by the recipient, the transfer will be
+     * reverted.
+     *
+     * The selector can be obtained in Solidity with `IERC721Receiver.onERC721Received.selector`.
+     */
+    function onERC721Received(
+        address operator,
+        address from,
+        uint256 tokenId,
+        bytes calldata data
+    ) external returns (bytes4);
+}
+
 // src/interfaces/IVaultBExecutionV2.sol
 
 interface IChainlinkAggregatorV3 {
@@ -316,10 +350,19 @@ interface IChainlinkAggregatorV3 {
 }
 
 interface IVaultBPriceGuard {
+    function POOL_FEE() external view returns (uint24);
+
     function minimumOut(address tokenIn, address tokenOut, uint256 amountIn, bool emergency)
         external
         view
         returns (uint256 minOut);
+
+    function minimumOutAndBudget(address tokenIn, address tokenOut, uint256 amountIn, bool emergency)
+        external
+        view
+        returns (uint256 minOut, uint256 emergencyNotional, bool emergencyBudgetUsed);
+
+    function consumeEmergencyNotional(uint256 notional) external;
 
     function fairValue(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256 amountOut);
 
@@ -341,7 +384,16 @@ interface IVaultBExecutionAdapterV2 {
 }
 
 interface IVaultBRewardPriceGuard {
+    function DIRECT_ORACLE_FEE() external view returns (uint24);
+
     function minimumOut(uint256 amountIn, bool emergency) external view returns (uint256 minOut);
+
+    function minimumOutAndBudget(uint256 amountIn, bool emergency)
+        external
+        view
+        returns (uint256 minOut, uint256 emergencyNotional, bool emergencyBudgetUsed);
+
+    function consumeEmergencyNotional(uint256 notional) external;
 
     function fairValue(uint256 amountIn) external view returns (uint256 amountOut);
 }
@@ -373,6 +425,137 @@ interface IPancakeV3SwapRouterWithDeadline {
     }
 
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
+// src/libraries/MainV2Jobs.sol
+
+/// @notice Job/chunk types shared by `DedicatedVaultMainV2` and `MainV2Jobs`.
+/// File-level so both refer to the SAME declaration — the mapping value type in
+/// `Main` must match the storage-pointer parameter type of the library.
+enum JobKind {
+    NONE,
+    OPEN,
+    CLOSE_TO_INVENTORY,
+    LIQUIDATE_WBNB,
+    LIQUIDATE_REWARD
+}
+
+enum JobStatus {
+    NONE,
+    ACTIVE,
+    COMPLETED
+}
+
+struct Job {
+    JobKind kind;
+    JobStatus status;
+    uint64 createdAt;
+    uint64 completedAt;
+    uint32 chunks;
+    uint256 cumulativeInput;
+    uint256 cumulativeOutput;
+    uint256 cumulativeNotionalAsset;
+}
+
+/// @title MainV2Jobs
+/// @notice Job lifecycle + chunk de-duplication + per-job/per-day swap-notional
+/// accounting, extracted from `DedicatedVaultMainV2` so the code deploys once and
+/// links (EIP-170). Moved verbatim; the storage the functions touch (the `jobs`,
+/// `usedChunks` and `dailySwapNotional` mappings) is passed by reference — a
+/// linked library runs via `delegatecall`, so the pointers address `Main`'s own
+/// storage, and the caps that are configuration are passed by value. The error
+/// signatures match `Main`'s, so their selectors are identical for existing
+/// `expectRevert(DedicatedVaultMainV2.X.selector)` tests.
+library MainV2Jobs {
+    error InvalidJobId();
+    error JobKindMismatch(JobKind expected, JobKind actual);
+    error JobAlreadyCompleted();
+    error DuplicateChunk(uint32 chunkIndex);
+    error NonSequentialChunk(uint32 provided, uint32 expected);
+    error SwapCapExceeded(uint256 requested, uint256 cap);
+    error DailySwapCapExceeded(uint256 requested, uint256 cap);
+
+    /// @notice Open or continue a chunked job and mark `chunkIndex` used exactly
+    /// once. Returns the job storage slot so the caller can read/write its fields.
+    function beginChunk(
+        mapping(bytes32 => Job) storage jobs,
+        mapping(bytes32 => mapping(uint32 => bool)) storage usedChunks,
+        bytes32 jobId,
+        JobKind kind,
+        uint32 chunkIndex
+    ) external returns (Job storage job) {
+        if (jobId == bytes32(0)) revert InvalidJobId();
+        job = jobs[jobId];
+        if (job.status == JobStatus.NONE) {
+            job.kind = kind;
+            job.status = JobStatus.ACTIVE;
+            job.createdAt = uint64(block.timestamp);
+        } else {
+            if (job.kind != kind) revert JobKindMismatch(job.kind, kind);
+            if (job.status == JobStatus.COMPLETED) revert JobAlreadyCompleted();
+        }
+        if (usedChunks[jobId][chunkIndex]) revert DuplicateChunk(chunkIndex);
+        // Chunks must be consecutive from zero (B9-T1): `job.chunks` is the count so
+        // far, so the next index must equal it. This forbids sparse indices (which
+        // hid how many chunks a series had) and makes the next index recoverable
+        // from state — the keeper's restart fix (K-T3) reads `job.chunks`. Checked
+        // AFTER the duplicate guard so replaying a used index still reverts
+        // DuplicateChunk, not this.
+        if (chunkIndex != job.chunks) revert NonSequentialChunk(chunkIndex, job.chunks);
+        usedChunks[jobId][chunkIndex] = true;
+        job.chunks += 1;
+    }
+
+    function completeJob(Job storage job) external {
+        job.status = JobStatus.COMPLETED;
+        job.completedAt = uint64(block.timestamp);
+    }
+
+    /// @notice Reserve `notional` against the job cap and the day's turnover.
+    /// Emergency volume is still ACCOUNTED (so a later normal swap sees it), but
+    /// only the daily-LIMIT check is skipped for emergencies — a deliberate relief.
+    function reserveSwapNotional(
+        mapping(uint64 => uint256) storage dailySwapNotional,
+        Job storage job,
+        uint256 notional,
+        bool emergency,
+        uint256 hardMaxActiveAssets,
+        uint256 swapPerJobCap,
+        uint256 dailySwapLimit
+    ) external {
+        uint256 jobTotal = job.cumulativeNotionalAsset + notional;
+        uint256 jobCap = emergency ? hardMaxActiveAssets : swapPerJobCap;
+        if (jobTotal > jobCap) revert SwapCapExceeded(jobTotal, jobCap);
+        job.cumulativeNotionalAsset = jobTotal;
+
+        uint64 day = uint64(block.timestamp / 1 days);
+        uint256 dayTotal = dailySwapNotional[day] + notional;
+        if (!emergency && dayTotal > dailySwapLimit) revert DailySwapCapExceeded(dayTotal, dailySwapLimit);
+        dailySwapNotional[day] = dayTotal;
+    }
+
+    /// @notice Open-swap-chunk accounting (B8-T1). Unlike `reserveSwapNotional`
+    /// (used by liquidations, unchanged), the per-transaction cap `swapPerJobCap`
+    /// bounds THIS CHUNK, not the job's running total — a swap leg larger than the
+    /// per-tx cap is filled as a series of chunks (each capped for slippage), while
+    /// the day's turnover still accumulates across all chunks. The job total
+    /// (`cumulativeNotionalAsset`) is tracked but NOT capped here; the aggregate
+    /// bound is the caller's incremental `canaryOpenCap` check (position size).
+    function reserveSwapChunk(
+        mapping(uint64 => uint256) storage dailySwapNotional,
+        Job storage job,
+        uint256 notional,
+        uint256 swapPerJobCap,
+        uint256 dailySwapLimit
+    ) external {
+        if (notional > swapPerJobCap) revert SwapCapExceeded(notional, swapPerJobCap);
+        job.cumulativeNotionalAsset += notional;
+
+        uint64 day = uint64(block.timestamp / 1 days);
+        uint256 dayTotal = dailySwapNotional[day] + notional;
+        if (dayTotal > dailySwapLimit) revert DailySwapCapExceeded(dayTotal, dailySwapLimit);
+        dailySwapNotional[day] = dayTotal;
+    }
 }
 
 // lib/openzeppelin-contracts/contracts/utils/StorageSlot.sol
@@ -518,6 +701,63 @@ library StorageSlot {
     }
 }
 
+// src/libraries/TickMath.sol
+
+/// @title Math library for computing sqrt prices from ticks and vice versa
+/// @notice Vendored from Uniswap V3 (BSD-2-Clause). Computes sqrt price for
+///         ticks of size 1.0001, i.e. sqrt(1.0001^tick) * 2^96 as a Q64.96.
+///         Supports prices between 2^-128 and 2^128.
+///
+///         Used here only for the `getSqrtRatioAtTick` direction, to convert
+///         a TWAP arithmetic-mean-tick (derived from pool.observe()) into a
+///         sqrtPriceX96 that the adapter's amount-conversion routine consumes
+///         in place of the manipulable slot0 spot read.
+library TickMath {
+    /// @dev The minimum tick that may be passed to #getSqrtRatioAtTick.
+    int24 internal constant MIN_TICK = -887272;
+    /// @dev The maximum tick that may be passed to #getSqrtRatioAtTick.
+    int24 internal constant MAX_TICK = -MIN_TICK;
+
+    /// @notice Calculates sqrt(1.0001^tick) * 2^96
+    /// @dev Throws if |tick| > max tick
+    /// @param tick The input tick for the above formula
+    /// @return sqrtPriceX96 A Fixed point Q64.96 number representing the sqrt of the ratio of the two assets (token1/token0)
+    /// at the given tick
+    function getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
+        uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
+        require(absTick <= uint256(int256(MAX_TICK)), "T");
+
+        uint256 ratio = absTick & 0x1 != 0
+            ? 0xfffcb933bd6fad37aa2d162d1a594001
+            : 0x100000000000000000000000000000000;
+        if (absTick & 0x2     != 0) ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128;
+        if (absTick & 0x4     != 0) ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdcc) >> 128;
+        if (absTick & 0x8     != 0) ratio = (ratio * 0xffe5caca7e10e4e61c3624eaa0941cd0) >> 128;
+        if (absTick & 0x10    != 0) ratio = (ratio * 0xffcb9843d60f6159c9db58835c926644) >> 128;
+        if (absTick & 0x20    != 0) ratio = (ratio * 0xff973b41fa98c081472e6896dfb254c0) >> 128;
+        if (absTick & 0x40    != 0) ratio = (ratio * 0xff2ea16466c96a3843ec78b326b52861) >> 128;
+        if (absTick & 0x80    != 0) ratio = (ratio * 0xfe5dee046a99a2a811c461f1969c3053) >> 128;
+        if (absTick & 0x100   != 0) ratio = (ratio * 0xfcbe86c7900a88aedcffc83b479aa3a4) >> 128;
+        if (absTick & 0x200   != 0) ratio = (ratio * 0xf987a7253ac413176f2b074cf7815e54) >> 128;
+        if (absTick & 0x400   != 0) ratio = (ratio * 0xf3392b0822b70005940c7a398e4b70f3) >> 128;
+        if (absTick & 0x800   != 0) ratio = (ratio * 0xe7159475a2c29b7443b29c7fa6e889d9) >> 128;
+        if (absTick & 0x1000  != 0) ratio = (ratio * 0xd097f3bdfd2022b8845ad8f792aa5825) >> 128;
+        if (absTick & 0x2000  != 0) ratio = (ratio * 0xa9f746462d870fdf8a65dc1f90e061e5) >> 128;
+        if (absTick & 0x4000  != 0) ratio = (ratio * 0x70d869a156d2a1b890bb3df62baf32f7) >> 128;
+        if (absTick & 0x8000  != 0) ratio = (ratio * 0x31be135f97d08fd981231505542fcfa6) >> 128;
+        if (absTick & 0x10000 != 0) ratio = (ratio * 0x9aa508b5b7a84e1c677de54f3e99bc9)   >> 128;
+        if (absTick & 0x20000 != 0) ratio = (ratio * 0x5d6af8dedb81196699c329225ee604)    >> 128;
+        if (absTick & 0x40000 != 0) ratio = (ratio * 0x2216e584f5fa1ea926041bedfe98)      >> 128;
+        if (absTick & 0x80000 != 0) ratio = (ratio * 0x48a170391f7dc42444e8fa2)           >> 128;
+
+        if (tick > 0) ratio = type(uint256).max / ratio;
+
+        // this divides by 1<<32 rounding up to go from a Q128.128 to a Q128.96.
+        // we then downcast because we know the result always fits within 160 bits
+        sqrtPriceX96 = uint160((ratio >> 32) + (ratio % (1 << 32) == 0 ? 0 : 1));
+    }
+}
+
 // lib/openzeppelin-contracts/contracts/utils/introspection/ERC165.sol
 
 // OpenZeppelin Contracts (last updated v5.4.0) (utils/introspection/ERC165.sol)
@@ -538,6 +778,30 @@ abstract contract ERC165 is IERC165 {
     /// @inheritdoc IERC165
     function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
         return interfaceId == type(IERC165).interfaceId;
+    }
+}
+
+// lib/openzeppelin-contracts/contracts/token/ERC721/utils/ERC721Holder.sol
+
+// OpenZeppelin Contracts (last updated v5.5.0) (token/ERC721/utils/ERC721Holder.sol)
+
+/**
+ * @dev Implementation of the {IERC721Receiver} interface.
+ *
+ * Accepts all token transfers.
+ * Make sure the contract is able to use its token with {IERC721-safeTransferFrom}, {IERC721-approve} or
+ * {IERC721-setApprovalForAll}.
+ *
+ * @custom:stateless
+ */
+abstract contract ERC721Holder is IERC721Receiver {
+    /**
+     * @dev See {IERC721Receiver-onERC721Received}.
+     *
+     * Always returns `IERC721Receiver.onERC721Received.selector`.
+     */
+    function onERC721Received(address, address, uint256, bytes memory) public virtual returns (bytes4) {
+        return this.onERC721Received.selector;
     }
 }
 
@@ -654,6 +918,107 @@ interface IPairedSwapIn {
 
 // OpenZeppelin Contracts (last updated v5.4.0) (interfaces/IERC20.sol)
 
+// src/libraries/LiquidityAmounts.sol
+
+/// @title LiquidityAmounts — canonical Uniswap V3 (v3-periphery) liquidity↔amounts math.
+/// @notice Verbatim canonical formulas (Uniswap/v3-periphery `LiquidityAmounts.sol`),
+/// 0.8-compatible (no overflow tricks — uses audited `FullMath.mulDiv`). NOT hand-rolled
+/// novel math: this is the standard, audited algorithm used across V3 integrations.
+/// Q96 = 2**96. All results truncate down (FullMath.mulDiv) → conservative for NAV.
+library LiquidityAmounts {
+    uint256 internal constant Q96 = 0x1000000000000000000000000;
+
+    function getLiquidityForAmount0(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint256 amount0)
+        internal
+        pure
+        returns (uint128 liquidity)
+    {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        uint256 intermediate = FullMath.mulDiv(sqrtRatioAX96, sqrtRatioBX96, Q96);
+        return _toUint128(FullMath.mulDiv(amount0, intermediate, sqrtRatioBX96 - sqrtRatioAX96));
+    }
+
+    function getLiquidityForAmount1(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint256 amount1)
+        internal
+        pure
+        returns (uint128 liquidity)
+    {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        return _toUint128(FullMath.mulDiv(amount1, Q96, sqrtRatioBX96 - sqrtRatioAX96));
+    }
+
+    /// @dev Maximum liquidity mintable from both desired token amounts at the
+    /// current price. Canonical Uniswap V3 periphery formula.
+    function getLiquidityForAmounts(
+        uint160 sqrtRatioX96,
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint256 amount0,
+        uint256 amount1
+    ) internal pure returns (uint128 liquidity) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) {
+            (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        }
+        if (sqrtRatioX96 <= sqrtRatioAX96) {
+            return getLiquidityForAmount0(sqrtRatioAX96, sqrtRatioBX96, amount0);
+        }
+        if (sqrtRatioX96 < sqrtRatioBX96) {
+            uint128 liquidity0 = getLiquidityForAmount0(sqrtRatioX96, sqrtRatioBX96, amount0);
+            uint128 liquidity1 = getLiquidityForAmount1(sqrtRatioAX96, sqrtRatioX96, amount1);
+            return liquidity0 < liquidity1 ? liquidity0 : liquidity1;
+        }
+        return getLiquidityForAmount1(sqrtRatioAX96, sqrtRatioBX96, amount1);
+    }
+
+    /// @dev amount0 for a given liquidity over [sqrtA, sqrtB].
+    function getAmount0ForLiquidity(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint128 liquidity)
+        internal
+        pure
+        returns (uint256 amount0)
+    {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        return FullMath.mulDiv(uint256(liquidity) << 96, sqrtRatioBX96 - sqrtRatioAX96, sqrtRatioBX96) / sqrtRatioAX96;
+    }
+
+    /// @dev amount1 for a given liquidity over [sqrtA, sqrtB].
+    function getAmount1ForLiquidity(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint128 liquidity)
+        internal
+        pure
+        returns (uint256 amount1)
+    {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        return FullMath.mulDiv(liquidity, sqrtRatioBX96 - sqrtRatioAX96, Q96);
+    }
+
+    /// @dev (amount0, amount1) currently represented by `liquidity` at price `sqrtRatioX96`.
+    /// Below range → all token0; in range → both; above range → all token1.
+    function getAmountsForLiquidity(
+        uint160 sqrtRatioX96,
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint128 liquidity
+    ) internal pure returns (uint256 amount0, uint256 amount1) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) {
+            (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        }
+        if (sqrtRatioX96 <= sqrtRatioAX96) {
+            amount0 = getAmount0ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity);
+        } else if (sqrtRatioX96 < sqrtRatioBX96) {
+            amount0 = getAmount0ForLiquidity(sqrtRatioX96, sqrtRatioBX96, liquidity);
+            amount1 = getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioX96, liquidity);
+        } else {
+            amount1 = getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity);
+        }
+    }
+
+    function _toUint128(uint256 value) private pure returns (uint128) {
+        require(value <= type(uint128).max, "LA");
+        // The explicit bound above makes this narrowing cast lossless.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint128(value);
+    }
+}
+
 // lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol
 
 // OpenZeppelin Contracts (last updated v5.5.0) (utils/ReentrancyGuard.sol)
@@ -768,6 +1133,78 @@ abstract contract ReentrancyGuard {
 
     function _reentrancyGuardStorageSlot() internal pure virtual returns (bytes32) {
         return REENTRANCY_GUARD_STORAGE;
+    }
+}
+
+// src/libraries/MainV2Geometry.sol
+
+/// @title MainV2Geometry
+/// @notice Pure concentrated-liquidity geometry extracted from
+/// `DedicatedVaultMainV2` so its heavy `TickMath`/`LiquidityAmounts` expansions
+/// deploy once and link, instead of inlining into `Main` (EIP-170). These are the
+/// exact computations that were internal to `Main` (B1-T4/B1-T5), moved verbatim —
+/// no behavioural change. The `external` linkage is what removes the bytecode from
+/// `Main`; the functions are `pure`, so the delegatecall carries no state risk.
+/// @dev The error signatures match `DedicatedVaultMainV2`'s, so their selectors
+/// are identical and existing `expectRevert(DedicatedVaultMainV2.X.selector)`
+/// tests still match a revert originating here.
+library MainV2Geometry {
+    uint256 internal constant BPS = 10_000;
+    uint256 internal constant Q96 = 0x1000000000000000000000000;
+
+    error InvalidTickRange(int24 tickLower, int24 tickUpper);
+    error TwapOutsideTickRange();
+
+    /// @notice USDT (18 dec) per 1e18 WBNB implied by a pool sqrtPriceX96. The
+    /// pool is USDT(token0)/WBNB(token1), so price(token1/token0)=(sqrt/2^96)^2 is
+    /// WBNB per USDT; its inverse, scaled by 1e18, is USDT per WBNB.
+    function usdtPerWbnbFromSqrt(uint160 sqrtPriceX96) external pure returns (uint256) {
+        uint256 tmp = FullMath.mulDiv(Q96, Q96, sqrtPriceX96); // 2^192 / sqrt
+        return FullMath.mulDiv(tmp, 1e18, sqrtPriceX96); // (2^192/sqrt) * 1e18 / sqrt
+    }
+
+    /// @notice `expected` haircut by `lossBps`, floored at 1 so a two-sided leg
+    /// never rounds its slippage guard to zero.
+    function boundedLpMinimum(uint256 expected, uint16 lossBps) external pure returns (uint256) {
+        if (expected == 0) return 0;
+        uint256 minimum = FullMath.mulDiv(expected, BPS - lossBps, BPS);
+        return minimum == 0 ? 1 : minimum;
+    }
+
+    /// @notice Amounts the mint would consume for `assetDesired`/`pairedDesired`
+    /// evaluated at the TWAP price. Same geometry the venue previews, but anchored
+    /// to TWAP rather than the current spot.
+    function expectedMintAmountsAtTwap(
+        uint256 assetDesired,
+        uint256 pairedDesired,
+        int24 tickLower,
+        int24 tickUpper,
+        uint160 twapSqrt
+    ) external pure returns (uint256 assetExpected, uint256 pairedExpected) {
+        uint160 sqrtA = TickMath.getSqrtRatioAtTick(tickLower);
+        uint160 sqrtB = TickMath.getSqrtRatioAtTick(tickUpper);
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(twapSqrt, sqrtA, sqrtB, assetDesired, pairedDesired);
+        (assetExpected, pairedExpected) = LiquidityAmounts.getAmountsForLiquidity(twapSqrt, sqrtA, sqrtB, liquidity);
+    }
+
+    /// @notice Validate the requested tick range against the TWAP sqrt price. The
+    /// range must have a bounded width and strictly straddle the TWAP price, so a
+    /// manipulated spot cannot steer the keeper into a degenerate or out-of-range
+    /// mint. `minTickWidth`/`maxTickWidth`/`twapSqrt` are read in `Main` and passed
+    /// in, keeping every state/oracle read on the caller side.
+    function validateOpenTicks(
+        int24 tickLower,
+        int24 tickUpper,
+        int24 minTickWidth,
+        int24 maxTickWidth,
+        uint160 twapSqrt
+    ) external pure {
+        if (tickLower >= tickUpper) revert InvalidTickRange(tickLower, tickUpper);
+        int24 width = tickUpper - tickLower;
+        if (width < minTickWidth || width > maxTickWidth) revert InvalidTickRange(tickLower, tickUpper);
+        uint160 sqrtLower = TickMath.getSqrtRatioAtTick(tickLower);
+        uint160 sqrtUpper = TickMath.getSqrtRatioAtTick(tickUpper);
+        if (twapSqrt <= sqrtLower || twapSqrt >= sqrtUpper) revert TwapOutsideTickRange();
     }
 }
 
@@ -1334,12 +1771,545 @@ library SafeERC20 {
     }
 }
 
+// src/libraries/MainV2Valuation.sol
+
+interface IV3PoolSpotV {
+    function slot0() external view returns (uint160 sqrtPriceX96, int24, uint16, uint16, uint16, uint32, bool);
+}
+
+/// @title MainV2Valuation
+/// @notice NAV / exposure / spot-oracle-coherence view logic extracted from
+/// `DedicatedVaultMainV2` so its orchestration deploys once and links (EIP-170).
+/// These are the exact computations that were internal to `Main`
+/// (B1-T5/B1-T13), moved verbatim; every state/balance read stays on the caller
+/// side and is passed in, so the `external`, `view`, no-storage-write linkage
+/// carries no state risk. The `SpotDivergedFromOracle` signature matches
+/// `Main`'s, so its selector is identical for existing `expectRevert` tests.
+library MainV2Valuation {
+    uint256 internal constant BPS = 10_000;
+    address internal constant USDT = 0x55d398326f99059fF775485246999027B3197955;
+    address internal constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
+    uint256 internal constant Q96 = 0x1000000000000000000000000;
+
+    error SpotDivergedFromOracle(uint256 spotUsdtPerWbnb, uint256 oracleUsdtPerWbnb);
+    error CloseValueBelowFloor(uint256 minimumValue, uint256 actualValue);
+
+    /// @notice Revenue-conservative NAV in USDT: minimumOut haircut on paired and
+    /// reward inventory, and for the active position the LOWER of the TWAP/spot
+    /// geometry (each oracle-valued) so a spot manipulation cannot inflate NAV.
+    function totalAssetsUsdt(
+        IDedicatedVenueV2 venue,
+        IVaultBPriceGuard priceGuard,
+        IVaultBRewardPriceGuard rewardPriceGuard,
+        uint256 assetBalance,
+        uint256 pairedBalance,
+        uint256 rewardBalance,
+        uint256 activePositionId
+    ) external view returns (uint256 total) {
+        total = assetBalance;
+        if (pairedBalance != 0) total += priceGuard.minimumOut(WBNB, USDT, pairedBalance, false);
+        if (activePositionId != 0) {
+            priceGuard.minimumOut(WBNB, USDT, 1e18, false); // oracle cross-check even for one-sided USDT
+            uint160 twapSqrtPrice = priceGuard.twapSqrtPriceX96();
+            (uint256 twapAsset, uint256 twapPaired) =
+                venue.previewCloseAmountsAtSqrtPrice(activePositionId, twapSqrtPrice);
+            (uint256 spotAsset, uint256 spotPaired) = venue.previewCloseAmounts(activePositionId);
+            uint256 twapValue = twapAsset + (twapPaired != 0 ? priceGuard.minimumOut(WBNB, USDT, twapPaired, false) : 0);
+            uint256 spotValue = spotAsset + (spotPaired != 0 ? priceGuard.minimumOut(WBNB, USDT, spotPaired, false) : 0);
+            total += twapValue < spotValue ? twapValue : spotValue;
+        }
+        if (rewardBalance != 0) total += rewardPriceGuard.minimumOut(rewardBalance, false);
+    }
+
+    /// @notice Deposit-conservative NAV in USDT (B10-T2): identical to
+    /// `totalAssetsUsdt` — same oracle-valued (`minimumOut`) paired/reward legs —
+    /// EXCEPT the active position uses the HIGHER of the TWAP/spot geometry. NAV is
+    /// directional: redemptions must not OVER-value (that dilutes remaining holders,
+    /// so `totalAssetsUsdt` takes the min), but deposits must not UNDER-value (that
+    /// dilutes existing holders by minting too many shares). A downward spot push
+    /// lowers `spotValue`; `min` would pick it and hand a depositor cheap shares.
+    /// Taking the max here removes that direction of the manipulation; the paired
+    /// legs are still oracle-priced, so only the position geometry — not the price —
+    /// is affected. Griefer symmetric to the redeem side under `min`: pushing spot
+    /// UP before someone else's deposit mints them fewer shares, which costs the
+    /// attacker and does not pay. Used only for the deposit/mint path.
+    function totalAssetsUsdtUpper(
+        IDedicatedVenueV2 venue,
+        IVaultBPriceGuard priceGuard,
+        IVaultBRewardPriceGuard rewardPriceGuard,
+        uint256 assetBalance,
+        uint256 pairedBalance,
+        uint256 rewardBalance,
+        uint256 activePositionId
+    ) external view returns (uint256 total) {
+        total = assetBalance;
+        if (pairedBalance != 0) total += priceGuard.minimumOut(WBNB, USDT, pairedBalance, false);
+        if (activePositionId != 0) {
+            priceGuard.minimumOut(WBNB, USDT, 1e18, false); // oracle cross-check even for one-sided USDT
+            uint160 twapSqrtPrice = priceGuard.twapSqrtPriceX96();
+            (uint256 twapAsset, uint256 twapPaired) =
+                venue.previewCloseAmountsAtSqrtPrice(activePositionId, twapSqrtPrice);
+            (uint256 spotAsset, uint256 spotPaired) = venue.previewCloseAmounts(activePositionId);
+            uint256 twapValue = twapAsset + (twapPaired != 0 ? priceGuard.minimumOut(WBNB, USDT, twapPaired, false) : 0);
+            uint256 spotValue = spotAsset + (spotPaired != 0 ? priceGuard.minimumOut(WBNB, USDT, spotPaired, false) : 0);
+            total += twapValue > spotValue ? twapValue : spotValue;
+        }
+        if (rewardBalance != 0) total += rewardPriceGuard.minimumOut(rewardBalance, false);
+    }
+
+    /// @notice Exposure of the strategy in USDT for the capital ceiling: fair-mid
+    /// valued (no haircut) and, for the active position, the HIGHER of the
+    /// TWAP/spot geometry — the opposite direction of the conservative NAV.
+    function fundingExposureUsdt(
+        IDedicatedVenueV2 venue,
+        IVaultBPriceGuard priceGuard,
+        IVaultBRewardPriceGuard rewardPriceGuard,
+        uint256 assetBalance,
+        uint256 pairedBalance,
+        uint256 rewardBalance,
+        uint256 activePositionId
+    ) external view returns (uint256 total) {
+        total = assetBalance;
+        if (pairedBalance != 0) total += priceGuard.fairValue(WBNB, USDT, pairedBalance);
+        if (activePositionId != 0) {
+            priceGuard.minimumOut(WBNB, USDT, 1e18, false); // oracle coherence, as in NAV
+            uint160 twapSqrtPrice = priceGuard.twapSqrtPriceX96();
+            (uint256 twapAsset, uint256 twapPaired) =
+                venue.previewCloseAmountsAtSqrtPrice(activePositionId, twapSqrtPrice);
+            (uint256 spotAsset, uint256 spotPaired) = venue.previewCloseAmounts(activePositionId);
+            uint256 twapValue = twapAsset + (twapPaired != 0 ? priceGuard.fairValue(WBNB, USDT, twapPaired) : 0);
+            uint256 spotValue = spotAsset + (spotPaired != 0 ? priceGuard.fairValue(WBNB, USDT, spotPaired) : 0);
+            total += twapValue > spotValue ? twapValue : spotValue;
+        }
+        if (rewardBalance != 0) total += rewardPriceGuard.fairValue(rewardBalance);
+    }
+
+    /// @notice Build the bounded close plan on one valuation basis.
+    function closePlan(
+        IVaultBPriceGuard priceGuard,
+        uint256 assetExpected,
+        uint256 pairedExpected,
+        uint16 lossBps,
+        bool emergency
+    )
+        external
+        view
+        returns (uint256 amount0Min, uint256 amount1Min, uint256 expectedFairValue, uint256 aggregateFloor)
+    {
+        amount0Min = MainV2Geometry.boundedLpMinimum(assetExpected, lossBps);
+        amount1Min = MainV2Geometry.boundedLpMinimum(pairedExpected, lossBps);
+        uint256 expectedExecutionValue;
+        (expectedFairValue, expectedExecutionValue) =
+            _closeInventoryValues(priceGuard, assetExpected, pairedExpected, emergency);
+        aggregateFloor = FullMath.mulDiv(expectedExecutionValue, BPS - lossBps, BPS);
+    }
+
+    /// @notice Validate realized inventory against the precomputed aggregate floor.
+    function validateCloseProceeds(
+        IVaultBPriceGuard priceGuard,
+        uint256 assetReceived,
+        uint256 pairedReceived,
+        bool emergency,
+        uint256 aggregateFloor
+    ) external view returns (uint256 actualFairValue) {
+        uint256 actualExecutionValue;
+        (actualFairValue, actualExecutionValue) =
+            _closeInventoryValues(priceGuard, assetReceived, pairedReceived, emergency);
+        if (actualExecutionValue < aggregateFloor) {
+            revert CloseValueBelowFloor(aggregateFloor, actualExecutionValue);
+        }
+    }
+
+    function _closeInventoryValues(
+        IVaultBPriceGuard priceGuard,
+        uint256 assetAmount,
+        uint256 pairedAmount,
+        bool emergency
+    ) private view returns (uint256 fairValue, uint256 executionValue) {
+        fairValue = assetAmount;
+        if (pairedAmount != 0) fairValue += priceGuard.fairValue(WBNB, USDT, pairedAmount);
+        executionValue = fairValue;
+        if (emergency && pairedAmount != 0) {
+            executionValue = assetAmount + priceGuard.minimumOut(WBNB, USDT, pairedAmount, true);
+        }
+    }
+
+    /// @notice Revert if the live pool spot price deviates from the oracle by more
+    /// than the allowed band. Spot comes from the pool via the venue; oracle price
+    /// is the guard's fair USDT value of 1 WBNB.
+    function requireSpotOracleCoherence(
+        IDedicatedVenueV2 venue,
+        IVaultBPriceGuard priceGuard,
+        uint16 maxDeviationBps,
+        uint16 emergencyDeviationBps,
+        bool emergency
+    ) external view {
+        uint256 oracleUsdtPerWbnb = priceGuard.fairValue(WBNB, USDT, 1e18);
+        if (oracleUsdtPerWbnb == 0) revert SpotDivergedFromOracle(0, 0);
+        (uint160 spotSqrt,,,,,,) = IV3PoolSpotV(venue.poolAddress()).slot0();
+        uint256 tmp = FullMath.mulDiv(Q96, Q96, spotSqrt);
+        uint256 spotUsdtPerWbnb = FullMath.mulDiv(tmp, 1e18, spotSqrt);
+        uint256 diff = spotUsdtPerWbnb > oracleUsdtPerWbnb
+            ? spotUsdtPerWbnb - oracleUsdtPerWbnb
+            : oracleUsdtPerWbnb - spotUsdtPerWbnb;
+        uint16 tol = emergency ? emergencyDeviationBps : maxDeviationBps;
+        if (FullMath.mulDiv(diff, BPS, oracleUsdtPerWbnb) > tol) {
+            revert SpotDivergedFromOracle(spotUsdtPerWbnb, oracleUsdtPerWbnb);
+        }
+    }
+}
+
+// src/libraries/MainV2Liquidation.sol
+
+/// @notice Parameters for a liquidation chunk. Grouped in a struct to keep the
+/// external call under the stack limit.
+struct LiqParams {
+    bytes32 jobId;
+    uint32 chunkIndex;
+    uint256 keeperMinOut;
+    uint256 deadline;
+    bool finalChunk;
+    bool emergency;
+    uint256 hardMaxActiveAssets;
+    uint256 swapPerJobCap;
+    uint256 dailySwapLimit;
+    uint256 dustTolerance;
+}
+
+/// @title MainV2Liquidation
+/// @notice Direct-Pancake chunked liquidation of paired-token (WBNB) and
+/// reward-token (CAKE) inventory, extracted verbatim from `DedicatedVaultMainV2`
+/// so the bodies deploy once and link (EIP-170). A linked library runs via
+/// `delegatecall`, so inside these functions `address(this)` is `Main`, token
+/// approvals/balances act on `Main`'s inventory, and the passed-in mapping
+/// pointers address `Main`'s storage — the code is unchanged, only relocated.
+/// `Main` keeps the role/halt gate and finishes with the execution-loss journal
+/// and the event. Error signatures match `Main`'s for selector-stable tests.
+library MainV2Liquidation {
+    using SafeERC20 for IERC20;
+
+    address internal constant USDT = 0x55d398326f99059fF775485246999027B3197955;
+    address internal constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
+
+    error InvalidAmount();
+    error SwapCapExceeded(uint256 requested, uint256 cap);
+    error SwapBelowFloor(uint256 floor, uint256 amountOut);
+    error InventoryRemaining(uint256 pairedBalance);
+    error RewardInventoryRemaining(uint256 rewardBalance);
+
+    function liquidateWbnb(
+        mapping(bytes32 => Job) storage jobs,
+        mapping(bytes32 => mapping(uint32 => bool)) storage usedChunks,
+        mapping(uint64 => uint256) storage dailySwapNotional,
+        IERC20 pairedToken,
+        IVaultBExecutionAdapterV2 executionAdapter,
+        IVaultBPriceGuard priceGuard,
+        LiqParams memory p
+    ) external returns (uint256 amountOut, uint256 amountIn, uint256 notional) {
+        Job storage job = MainV2Jobs.beginChunk(jobs, usedChunks, p.jobId, JobKind.LIQUIDATE_WBNB, p.chunkIndex);
+
+        uint256 balance = pairedToken.balanceOf(address(this));
+        if (balance == 0) revert InvalidAmount();
+
+        uint256 jobCap = p.emergency ? p.hardMaxActiveAssets : p.swapPerJobCap;
+        uint256 used = job.cumulativeNotionalAsset;
+        uint256 headroom = used >= jobCap ? 0 : jobCap - used;
+        notional = priceGuard.fairValue(WBNB, USDT, balance);
+        amountIn = balance;
+        // Slice down to per-job headroom only on a non-final chunk. A final chunk
+        // whose notional exceeds the cap still reverts SwapCapExceeded in
+        // reserveSwapNotional (single-call cap semantics unchanged); an oversized
+        // residual is drained by issuing non-final chunks first.
+        if (notional > headroom && !p.finalChunk) {
+            if (headroom == 0) revert SwapCapExceeded(notional, jobCap);
+            amountIn = FullMath.mulDiv(balance, headroom, notional);
+            if (amountIn == 0) revert SwapCapExceeded(notional, jobCap);
+            notional = priceGuard.fairValue(WBNB, USDT, amountIn);
+        }
+        MainV2Jobs.reserveSwapNotional(
+            dailySwapNotional, job, notional, p.emergency, p.hardMaxActiveAssets, p.swapPerJobCap, p.dailySwapLimit
+        );
+
+        // Pin the same guard floor that the adapter will enforce before it
+        // consumes emergency notional. Re-quoting after a successful swap can
+        // observe an exhausted budget and incorrectly replace the emergency
+        // floor with the normal floor.
+        uint256 floor = priceGuard.minimumOut(WBNB, USDT, amountIn, p.emergency);
+        pairedToken.forceApprove(address(executionAdapter), amountIn);
+        amountOut = executionAdapter.swapPairedToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
+        pairedToken.forceApprove(address(executionAdapter), 0);
+        if (amountOut < floor) revert SwapBelowFloor(floor, amountOut);
+
+        if (p.finalChunk) {
+            uint256 remaining = pairedToken.balanceOf(address(this));
+            if (remaining > p.dustTolerance) revert InventoryRemaining(remaining);
+            MainV2Jobs.completeJob(job);
+        }
+
+        job.cumulativeInput += amountIn;
+        job.cumulativeOutput += amountOut;
+    }
+
+    function liquidateReward(
+        mapping(bytes32 => Job) storage jobs,
+        mapping(bytes32 => mapping(uint32 => bool)) storage usedChunks,
+        mapping(uint64 => uint256) storage dailySwapNotional,
+        IERC20 rewardToken,
+        IVaultBRewardExecutionAdapterV2 rewardExecutionAdapter,
+        IVaultBRewardPriceGuard rewardPriceGuard,
+        LiqParams memory p
+    ) external returns (uint256 amountOut, uint256 amountIn, uint256 notional) {
+        Job storage job = MainV2Jobs.beginChunk(jobs, usedChunks, p.jobId, JobKind.LIQUIDATE_REWARD, p.chunkIndex);
+
+        uint256 balance = rewardToken.balanceOf(address(this));
+        if (balance == 0) revert InvalidAmount();
+
+        uint256 jobCap = p.emergency ? p.hardMaxActiveAssets : p.swapPerJobCap;
+        uint256 used = job.cumulativeNotionalAsset;
+        uint256 headroom = used >= jobCap ? 0 : jobCap - used;
+        notional = rewardPriceGuard.fairValue(balance);
+        amountIn = balance;
+        if (notional > headroom && !p.finalChunk) {
+            if (headroom == 0) revert SwapCapExceeded(notional, jobCap);
+            amountIn = FullMath.mulDiv(balance, headroom, notional);
+            if (amountIn == 0) revert SwapCapExceeded(notional, jobCap);
+            notional = rewardPriceGuard.fairValue(amountIn);
+        }
+        MainV2Jobs.reserveSwapNotional(
+            dailySwapNotional, job, notional, p.emergency, p.hardMaxActiveAssets, p.swapPerJobCap, p.dailySwapLimit
+        );
+
+        uint256 floor = rewardPriceGuard.minimumOut(amountIn, p.emergency);
+        rewardToken.forceApprove(address(rewardExecutionAdapter), amountIn);
+        amountOut = rewardExecutionAdapter.swapRewardToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
+        rewardToken.forceApprove(address(rewardExecutionAdapter), 0);
+        if (amountOut < floor) revert SwapBelowFloor(floor, amountOut);
+
+        if (p.finalChunk) {
+            uint256 remaining = rewardToken.balanceOf(address(this));
+            if (remaining > p.dustTolerance) revert RewardInventoryRemaining(remaining);
+            MainV2Jobs.completeJob(job);
+        }
+
+        job.cumulativeInput += amountIn;
+        job.cumulativeOutput += amountOut;
+    }
+}
+
+// src/libraries/MainV2Open.sol
+
+/// @notice Phase-1 swap-chunk inputs plus the caps Main reads. There is no
+/// `finalChunk` flag: the mint (openPosition) is the sole finalizer, and a param
+/// that reads like a control but is never enforced is an audit hazard (B8-T1).
+struct SwapChunkCall {
+    bytes32 jobId;
+    uint32 chunkIndex;
+    uint256 amountIn;
+    uint256 keeperMinOut;
+    uint256 deadline;
+    uint256 activePositionId;
+    uint256 swapBudget; // B11-T1: the reserved position budget (<= canaryOpenCap)
+    uint256 swapPerJobCap;
+    uint256 dailySwapLimit;
+}
+
+/// @notice Phase-2 mint inputs (from OpenParams) plus the Main config it reads.
+/// The swap legs are NOT here — B8-T1 splits the swap into openSwapChunk, so
+/// `openPosition` only mints from the inventory those chunks accumulated. Main's
+/// external OpenParams signature is unchanged; `swapAssetIn`/`keeperPairedMinOut`
+/// are simply unused in phase 2.
+struct OpenCall {
+    bytes32 jobId;
+    int24 tickLower;
+    int24 tickUpper;
+    uint256 assetBudget;
+    uint256 deadline;
+    uint256 activePositionId;
+    uint256 canaryOpenCap;
+    int24 minTickWidth;
+    int24 maxTickWidth;
+    uint16 mintLossBps;
+    uint256 pairedDustTolerance;
+    uint256 rewardDustTolerance;
+}
+
+/// @title MainV2Open
+/// @notice openPosition split into a chunkable swap phase (openSwapChunk) and a
+/// single-tx mint phase (openPosition), extracted from `DedicatedVaultMainV2`
+/// (EIP-170 / B8-T1). A linked library runs via `delegatecall`, so `address(this)`
+/// is `Main`: approvals/balances act on `Main`'s inventory and the mapping
+/// pointers address `Main`'s storage. `Main` keeps the role/mode gate, sets
+/// `activePositionId` and emits. Error signatures match `Main`'s.
+///
+/// A job's swap chunks accumulate into `Job.cumulativeInput` (USDT spent) and
+/// `Job.cumulativeOutput` (WBNB acquired) — reused verbatim, no new field. The
+/// mint then verifies the actual paired balance does not exceed what THIS job
+/// acquired beyond dust, so a donation or a second concurrent series is caught.
+library MainV2Open {
+    using SafeERC20 for IERC20;
+
+    uint256 internal constant BPS = 10_000;
+    address internal constant USDT = 0x55d398326f99059fF775485246999027B3197955;
+    address internal constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
+
+    error AdapterNotBound();
+    error PositionActive();
+    error InventoryPresent(uint256 pairedBalance);
+    error RewardInventoryPresent(uint256 rewardBalance);
+    error InvalidAmount();
+    error CapitalCapExceeded(uint256 requested, uint256 cap);
+    error OpenNotTwoSided();
+    error MintValueBelowFloor(uint256 expectedMinimum, uint256 actualValue);
+    error InvalidPositionId();
+    error JobKindMismatch(JobKind expected, JobKind actual);
+    error JobAlreadyCompleted();
+
+    /// @notice Phase 1: swap `amountIn` USDT to WBNB and accumulate it for the
+    /// open series `jobId`. Chunkable so a swap leg larger than swapPerJobCap can
+    /// be filled over several calls (price recovers between them). The executor
+    /// enforces the guard's own minimum, so keeperMinOut is a further keeper-side
+    /// bound. Job stays ACTIVE — the mint (openPosition) finalizes it.
+    function openSwapChunk(
+        mapping(bytes32 => Job) storage jobs,
+        mapping(bytes32 => mapping(uint32 => bool)) storage usedChunks,
+        mapping(uint64 => uint256) storage dailySwapNotional,
+        IVaultBExecutionAdapterV2 executionAdapter,
+        IERC20 asset,
+        SwapChunkCall memory c
+    ) external returns (uint256 pairedOut) {
+        if (c.activePositionId != 0) revert PositionActive();
+        if (c.amountIn == 0) revert InvalidAmount();
+        if (executionAdapter.main() != address(this)) revert AdapterNotBound();
+
+        Job storage job = MainV2Jobs.beginChunk(jobs, usedChunks, c.jobId, JobKind.OPEN, c.chunkIndex);
+
+        // Aggregate series bound, checked AFTER chunk sequencing (beginChunk) but
+        // BEFORE the swap moves any USDT: the total swapped across the series (this
+        // chunk included) may not exceed the reserved SWAP LEG (B11-T1), which is
+        // strictly below the position budget, so the mint leg (budget - swapped) is
+        // always positive and the inventory can never be stranded with the mint
+        // unreachable. Enforced per-chunk so an over-swap is caught when it occurs.
+        if (job.cumulativeInput + c.amountIn > c.swapBudget) {
+            revert CapitalCapExceeded(job.cumulativeInput + c.amountIn, c.swapBudget);
+        }
+        // Per-CHUNK swap cap (not per-job): a leg larger than swapPerJobCap is
+        // filled as a series of capped chunks; the day's turnover still accumulates
+        // across all of them. Liquidations keep the per-job `reserveSwapNotional`.
+        MainV2Jobs.reserveSwapChunk(dailySwapNotional, job, c.amountIn, c.swapPerJobCap, c.dailySwapLimit);
+
+        asset.forceApprove(address(executionAdapter), c.amountIn);
+        pairedOut = executionAdapter.swapAssetToPaired(c.amountIn, c.keeperMinOut, c.deadline, false);
+        asset.forceApprove(address(executionAdapter), 0);
+
+        job.cumulativeInput += c.amountIn;
+        job.cumulativeOutput += pairedOut;
+    }
+
+    /// @notice Phase 2: mint from the inventory the swap chunks accumulated for
+    /// `jobId`. No swap here. `assetForMint = assetBudget - USDT already swapped`;
+    /// the cap and two-sidedness are judged on the FINAL budget/legs, not a chunk.
+    function openPosition(
+        mapping(bytes32 => Job) storage jobs,
+        IVaultBPriceGuard priceGuard,
+        IDedicatedVenueV2 venue,
+        IERC20 asset,
+        IERC20 pairedToken,
+        IERC20 rewardToken,
+        OpenCall memory c
+    ) external returns (uint256 positionId, uint256 pairedAcquired) {
+        if (c.activePositionId != 0) revert PositionActive();
+        Job storage job = jobs[c.jobId];
+        // The swap phase must have created an OPEN series for this jobId (a NONE
+        // job has kind NONE != OPEN, so an unknown jobId is rejected here too), and
+        // it must not already be minted.
+        if (job.kind != JobKind.OPEN) revert JobKindMismatch(JobKind.OPEN, job.kind);
+        if (job.status == JobStatus.COMPLETED) revert JobAlreadyCompleted();
+
+        pairedAcquired = job.cumulativeOutput;
+        uint256 assetSwapped = job.cumulativeInput;
+        if (c.assetBudget <= assetSwapped) revert InvalidAmount(); // budget must leave a USDT mint leg
+        uint256 assetForMint = c.assetBudget - assetSwapped;
+        if (assetForMint > asset.balanceOf(address(this))) revert InvalidAmount();
+        if (c.assetBudget > c.canaryOpenCap) revert CapitalCapExceeded(c.assetBudget, c.canaryOpenCap);
+
+        // Distinguish THIS job's accumulated paired leg from a stray remainder /
+        // donation / a second concurrent series: the actual paired balance must not
+        // exceed what this job acquired by more than dust (B8-T1). Same dust
+        // threshold and semantics as P1-T1.
+        uint256 actualPaired = pairedToken.balanceOf(address(this));
+        if (actualPaired > pairedAcquired + c.pairedDustTolerance) revert InventoryPresent(actualPaired);
+        if (address(rewardToken) != address(0)) {
+            uint256 rewards = rewardToken.balanceOf(address(this));
+            if (rewards > c.rewardDustTolerance) revert RewardInventoryPresent(rewards);
+        }
+
+        uint160 twapSqrt = priceGuard.twapSqrtPriceX96();
+        MainV2Geometry.validateOpenTicks(c.tickLower, c.tickUpper, c.minTickWidth, c.maxTickWidth, twapSqrt);
+
+        // Expected mint geometry at TWAP from the FINAL legs (assetForMint USDT +
+        // pairedAcquired WBNB). A leg that rounds to zero at TWAP is not two-sided.
+        (uint256 assetExpected, uint256 pairedExpected) =
+            MainV2Geometry.expectedMintAmountsAtTwap(assetForMint, pairedAcquired, c.tickLower, c.tickUpper, twapSqrt);
+        if (assetExpected == 0 || pairedExpected == 0) revert OpenNotTwoSided();
+        uint256 amount0Min = MainV2Geometry.boundedLpMinimum(assetExpected, c.mintLossBps);
+        uint256 amount1Min = MainV2Geometry.boundedLpMinimum(pairedExpected, c.mintLossBps);
+
+        uint256 expectedFair =
+            assetExpected + (pairedExpected != 0 ? priceGuard.fairValue(WBNB, USDT, pairedExpected) : 0);
+        uint256 mintFloor = FullMath.mulDiv(expectedFair, BPS - c.mintLossBps, BPS);
+        uint256 assetBeforeMint = asset.balanceOf(address(this));
+        uint256 pairedBeforeMint = pairedToken.balanceOf(address(this));
+
+        asset.forceApprove(address(venue), assetForMint);
+        pairedToken.forceApprove(address(venue), pairedAcquired);
+        positionId = venue.open(
+            IDedicatedVenue.OpenArgs({
+                assetAmount: assetForMint,
+                pairedAmount: pairedAcquired,
+                tickLower: c.tickLower,
+                tickUpper: c.tickUpper,
+                amount0Min: amount0Min,
+                amount1Min: amount1Min,
+                deadline: c.deadline
+            })
+        );
+        asset.forceApprove(address(venue), 0);
+        pairedToken.forceApprove(address(venue), 0);
+        if (positionId == 0) revert InvalidPositionId();
+
+        uint256 assetConsumed = assetBeforeMint - asset.balanceOf(address(this));
+        uint256 pairedConsumed = pairedBeforeMint - pairedToken.balanceOf(address(this));
+        uint256 deployedValue =
+            assetConsumed + (pairedConsumed != 0 ? priceGuard.fairValue(WBNB, USDT, pairedConsumed) : 0);
+        if (deployedValue < mintFloor) revert MintValueBelowFloor(mintFloor, deployedValue);
+
+        MainV2Jobs.completeJob(job);
+    }
+}
+
 // src/DedicatedVaultMainV2.sol
 
+/// @dev Recovery surface added to the venue by B4-T1 (staged, resumable close and
+/// stranded-position write-off). Declared here so Main can drive it without
+/// changing the venue or its shared interface; `venue` is the sole caller the
+/// venue trusts (`onlyController`).
+interface IVenueRecovery {
+    function closeUnstake(uint256 positionId) external;
+    function closeDecrease(uint256 positionId, uint256 amount0Min, uint256 amount1Min, uint256 deadline) external;
+    function closeCollect(uint256 positionId) external;
+    function closeBurn(uint256 positionId) external;
+    function writeOffStrandedPosition() external returns (uint256 strandedId);
+}
+
+interface IVaultBWithdrawalCycleCommitReceiver {
+    function prepareWithdrawalCycleCommit() external;
+}
+
 /// @notice Vault B MainV2 prototype. It is intentionally deployed halted and
-/// direct-Pancake-only. Aggregator calldata and temporal slicing are outside
-/// this contract's first rollout.
-contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
+/// direct-Pancake-only. Aggregator calldata is outside this contract's first
+/// rollout; temporal slicing of paired/reward liquidation is supported (see
+/// `liquidateAllWbnb` / `liquidateAllReward`).
+contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     using SafeERC20 for IERC20;
 
     bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
@@ -1360,34 +2330,11 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
         OPERATING,
         CLOSED_TO_INVENTORY
     }
-    enum JobKind {
-        NONE,
-        OPEN,
-        CLOSE_TO_INVENTORY,
-        LIQUIDATE_WBNB,
-        LIQUIDATE_REWARD
-    }
-    enum JobStatus {
-        NONE,
-        ACTIVE,
-        COMPLETED
-    }
     enum WithdrawalStatus {
         NONE,
         REQUESTED,
         CLAIMED,
         CANCELED
-    }
-
-    struct Job {
-        JobKind kind;
-        JobStatus status;
-        uint64 createdAt;
-        uint64 completedAt;
-        uint32 chunks;
-        uint256 cumulativeInput;
-        uint256 cumulativeOutput;
-        uint256 cumulativeNotionalAsset;
     }
 
     struct WithdrawalRequest {
@@ -1424,8 +2371,70 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
     uint256 public swapPerJobCap;
     uint256 public dailySwapLimit;
 
+    /// @notice Max allowed deviation of the live pool spot price from the oracle
+    /// (Chainlink) price before a close is rejected. This is the missing guard: a
+    /// flash swap moves spot but not the oracle, so |spot - oracle| catches
+    /// manipulation while an honestly lagging TWAP (spot ~= oracle) passes. Never
+    /// zero, capped hard. The emergency threshold is wider for guardian recovery.
+    uint16 public constant HARD_MAX_SPOT_ORACLE_DEVIATION_BPS = 2_000;
+    uint16 public maxSpotOracleDeviationBps;
+    uint16 public emergencySpotOracleDeviationBps;
+    /// @notice Allowed width (in ticks) of an opened position. A too-narrow range
+    /// is trivially pushed out of range by a small spot move; there is also a hard
+    /// ceiling so admin can never widen it without bound. Defaults are set in the
+    /// constructor so the deploy signature is unchanged.
+    int24 public constant HARD_MAX_TICK_WIDTH = 200_000;
+    int24 public minTickWidth;
+    int24 public maxTickWidth;
+
+    /// @notice Residual paired-token (WBNB, 18 decimals) balance tolerated by
+    /// `isWithdrawalReady()` and by `sweepPairedDust()`. WBNB and USDT are both
+    /// plain BEP-20: anyone can raise this contract's balance with an ordinary
+    /// `transfer`, so gating readiness on an exact-zero balance lets an outsider
+    /// freeze all withdrawals for the cost of a 1-wei transfer. Derived from a
+    /// ~$0.05 notional target at ~$600/BNB (this repo's own fork-time quote for
+    /// the same WBNB/USDT pool is ~$640/BNB, see docs/launch-runbook.md):
+    /// 0.05 / 600 ~= 8.33e-5 BNB, rounded to a clean 1e14 wei (0.0001 BNB, ~$0.06
+    /// at $600/BNB). That is far below the smallest amount this contract ever
+    /// moves on purpose (canaryOpenCap / swapPerJobCap are hundreds to
+    /// thousands of USDT, see script/DeployVaultBV2.config.example.json) and
+    /// far above typical BSC transfer gas cost (~$0.05-$0.30), so it cannot be
+    /// used to write off a meaningful amount either.
+    uint256 public constant PAIRED_DUST_TOLERANCE = 1e14; // 0.0001 WBNB (~$0.06 @ $600/BNB)
+
+    /// @notice Residual reward-token (CAKE, 18 decimals) balance tolerated the
+    /// same way. Derived from the same ~$0.05 notional target at ~$1.50/CAKE
+    /// (current market price ~$1.43 rounded up): 0.05 / 1.5 ~= 0.0333 CAKE,
+    /// rounded to a clean 3e16 wei (0.03 CAKE, ~$0.045 @ $1.50/CAKE).
+    uint256 public constant REWARD_DUST_TOLERANCE = 3e16; // 0.03 CAKE (~$0.045 @ $1.50/CAKE)
+
     Mode public mode = Mode.HALTED;
     uint256 public activePositionId;
+    /// @notice The single in-progress open series (B9-T1). openSwapChunk fixes it on
+    /// the first chunk and refuses any other jobId until the series is minted or
+    /// explicitly cancelled, so `canaryOpenCap` (accumulated per job) is the true
+    /// AGGREGATE bound on the swap leg — a second jobId can no longer reset it.
+    bytes32 public activeOpenJobId;
+
+    /// @notice Immutable context of the in-progress open series (B11-T1). Captured by
+    /// reserveOpenSeries BEFORE the first swap so the FULL position budget — not just
+    /// the swap leg — is bounded by canaryOpenCap, the ticks are validated up front,
+    /// and the mint deadline has an upper bound. openPosition must match it exactly;
+    /// cancelOpenSeries clears it.
+    struct OpenSeriesContext {
+        uint256 assetBudget;
+        uint256 swapLeg;
+        int24 tickLower;
+        int24 tickUpper;
+        uint64 deadlineCeiling;
+        bool set;
+    }
+
+    OpenSeriesContext public openSeriesContext;
+    /// @notice Live count of DEFAULT_ADMIN_ROLE holders, so the last one cannot
+    /// renounce/revoke themselves and brick the vault (enableOperations is the
+    /// only path back to OPERATING and it is admin-only).
+    uint256 private _adminCount;
     /// @notice Sum of request-time asset hints. Informational only: queued
     /// redeemers remain exposed to NAV until claim, so the claim amount is
     /// supplied by the immutable strategy adapter at settlement time.
@@ -1451,9 +2460,13 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
     error PositionActive();
     error NoActivePosition();
     error InventoryPresent(uint256 pairedBalance);
+    error OpenSeriesActive(bytes32 activeJobId);
+    error NoActiveOpenSeries();
+    error OpenSeriesContextMismatch();
     error RewardInventoryPresent(uint256 rewardBalance);
     error InventoryRemaining(uint256 pairedBalance);
     error RewardInventoryRemaining(uint256 rewardBalance);
+    error SwapBelowFloor(uint256 floor, uint256 amountOut);
     error InvalidAmount();
     error InvalidDeadline();
     error CapitalCapExceeded(uint256 requested, uint256 cap);
@@ -1463,21 +2476,37 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
     error JobKindMismatch(JobKind expected, JobKind actual);
     error JobAlreadyCompleted();
     error DuplicateChunk(uint32 chunkIndex);
-    error SlicingDisabled();
+    error NonSequentialChunk(uint32 provided, uint32 expected);
     error InvalidPositionId();
     error OpenNotTwoSided();
+    error InvalidTickRange(int24 tickLower, int24 tickUpper);
+    error TwapOutsideTickRange();
+    error MintValueBelowFloor(uint256 expectedMinimum, uint256 actualValue);
+    error InvalidTickWidthBounds();
     error CloseValueBelowFloor(uint256 expectedMinimum, uint256 actualValue);
+    error SpotDivergedFromOracle(uint256 spotUsdtPerWbnb, uint256 oracleUsdtPerWbnb);
+    error InvalidSpotOracleDeviation();
+    error HaltedKeeperPath();
+    error LastAdminCannotBeRemoved();
     error WithdrawalExists();
     error WithdrawalUnknown();
     error WithdrawalNotReady();
     error OutstandingWithdrawals(uint256 requests);
     error WithdrawalBatchCommitted();
     error WithdrawalBatchEmpty();
+    error DustAboveTolerance(uint256 amount, uint256 tolerance);
 
     event ModeChanged(Mode indexed oldMode, Mode indexed newMode);
     event OperationalCapsUpdated(uint256 canaryOpenCap, uint256 swapPerJobCap, uint256 dailySwapLimit);
+    event SpotOracleDeviationUpdated(uint16 maxBps, uint16 emergencyBps);
+    event TickWidthBoundsUpdated(int24 minTickWidth, int24 maxTickWidth);
     event Funded(uint256 assets);
     event PositionOpened(bytes32 indexed jobId, uint256 indexed positionId, uint256 assetBudget, uint256 pairedOut);
+    event OpenSwapChunkExecuted(bytes32 indexed jobId, uint32 chunkIndex, uint256 amountIn, uint256 pairedOut);
+    event OpenSeriesReserved(
+        bytes32 indexed jobId, uint256 assetBudget, int24 tickLower, int24 tickUpper, uint256 deadlineCeiling
+    );
+    event OpenSeriesCancelled(bytes32 indexed jobId);
     event PositionClosedToInventory(
         bytes32 indexed jobId,
         uint256 indexed positionId,
@@ -1490,6 +2519,8 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
     event WbnbLiquidated(bytes32 indexed jobId, uint256 amountIn, uint256 amountOut, bool emergency);
     event RewardLiquidated(bytes32 indexed jobId, uint256 amountIn, uint256 amountOut, bool emergency);
     event PositionForceUnstaked(uint256 indexed positionId);
+    event VenueCloseStageRecovered(uint256 indexed positionId, uint8 stage);
+    event VenuePositionWrittenOff(uint256 indexed positionId, uint256 strandedTokenId, bool inventoryReturned);
     event WithdrawalRequested(bytes32 indexed requestId, uint256 assets);
     event WithdrawalCycleCommitted(uint256 requests);
     event WithdrawalExecutionLossRecorded(uint256 incrementalLoss, uint256 cumulativeLoss);
@@ -1497,6 +2528,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
     event WithdrawalClaimed(bytes32 indexed requestId, uint256 assets);
     event WithdrawalCanceled(bytes32 indexed requestId);
     event IdleWithdrawnToVault(uint256 assets);
+    event DustSwept(address indexed token, uint256 amount);
 
     constructor(
         address vault_,
@@ -1552,6 +2584,10 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
         canaryOpenCap = initialCanaryOpenCap_;
         swapPerJobCap = initialSwapPerJobCap_;
         dailySwapLimit = initialDailySwapLimit_;
+        maxSpotOracleDeviationBps = 200; // 2%
+        emergencySpotOracleDeviationBps = 1_000; // 10% for guardian recovery
+        minTickWidth = 2;
+        maxTickWidth = 20_000;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(KEEPER_ROLE, keeper_);
@@ -1577,6 +2613,22 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
         emit OperationalCapsUpdated(openCap, perJobCap, perDayCap);
     }
 
+    function setSpotOracleDeviationBps(uint16 maxBps, uint16 emergencyBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (maxBps == 0 || emergencyBps < maxBps || emergencyBps > HARD_MAX_SPOT_ORACLE_DEVIATION_BPS) {
+            revert InvalidSpotOracleDeviation();
+        }
+        maxSpotOracleDeviationBps = maxBps;
+        emergencySpotOracleDeviationBps = emergencyBps;
+        emit SpotOracleDeviationUpdated(maxBps, emergencyBps);
+    }
+
+    function setTickWidthBounds(int24 minWidth, int24 maxWidth) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (minWidth < 1 || maxWidth < minWidth || maxWidth > HARD_MAX_TICK_WIDTH) revert InvalidTickWidthBounds();
+        minTickWidth = minWidth;
+        maxTickWidth = maxWidth;
+        emit TickWidthBoundsUpdated(minWidth, maxWidth);
+    }
+
     function enableOperations() external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (
             executionAdapter.main() != address(this) || rewardExecutionAdapter.main() != address(this)
@@ -1594,11 +2646,15 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
                 || venue.poolAddress() != VAULT_B_POOL
         ) revert InvalidVenueIdentity();
         if (activePositionId != 0) revert PositionActive();
+        // Dust tolerance (P1-T1): same reasoning and threshold as openPosition and
+        // isWithdrawalReady — a 1-wei donation of the plain-BEP20 paired/reward
+        // token must not be able to freeze enableOperations; a meaningful
+        // remainder still blocks.
         uint256 inventory = pairedToken.balanceOf(address(this));
-        if (inventory != 0) revert InventoryPresent(inventory);
+        if (inventory > PAIRED_DUST_TOLERANCE) revert InventoryPresent(inventory);
         if (address(rewardToken) != address(0)) {
             uint256 rewards = rewardToken.balanceOf(address(this));
-            if (rewards != 0) revert RewardInventoryPresent(rewards);
+            if (rewards > REWARD_DUST_TOLERANCE) revert RewardInventoryPresent(rewards);
         }
         if (queuedWithdrawalCount != 0) revert OutstandingWithdrawals(queuedWithdrawalCount);
         _setMode(Mode.OPERATING);
@@ -1608,10 +2664,30 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
         _setMode(Mode.HALTED);
     }
 
+    /// @dev Track admin count and forbid removing the last admin. renounceRole and
+    /// revokeRole both route through _revokeRole, so this covers both.
+    function _grantRole(bytes32 role, address account) internal override returns (bool granted) {
+        granted = super._grantRole(role, account);
+        if (granted && role == DEFAULT_ADMIN_ROLE) _adminCount++;
+    }
+
+    function _revokeRole(bytes32 role, address account) internal override returns (bool revoked) {
+        if (role == DEFAULT_ADMIN_ROLE && _adminCount <= 1 && hasRole(DEFAULT_ADMIN_ROLE, account)) {
+            revert LastAdminCannotBeRemoved();
+        }
+        revoked = super._revokeRole(role, account);
+        if (revoked && role == DEFAULT_ADMIN_ROLE) _adminCount--;
+    }
+
     function fundFromVault(uint256 amount) external onlyVault nonReentrant {
         if (mode != Mode.OPERATING) revert OpensDisabled(mode);
         if (amount == 0) revert InvalidAmount();
-        uint256 postFundAssets = totalAssetsUsdt() + amount;
+        // The capital ceiling limits EXPOSURE, so it must not be fed the
+        // revenue-conservative NAV (minimumOut haircut + B1-T5 min(twap,spot)),
+        // which understates exposure and lets more in the more the position skews
+        // out of USDT. Value the exposure at fair mid, taking the HIGHER of the
+        // TWAP/spot geometry so the ceiling cannot be gamed by under-valuation.
+        uint256 postFundAssets = _fundingExposureUsdt() + amount;
         if (postFundAssets > hardMaxActiveAssets) {
             revert CapitalCapExceeded(postFundAssets, hardMaxActiveAssets);
         }
@@ -1688,73 +2764,209 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
     }
 
     function isWithdrawalReady() public view returns (bool) {
-        if (activePositionId != 0 || pairedToken.balanceOf(address(this)) != 0) return false;
-        return address(rewardToken) == address(0) || rewardToken.balanceOf(address(this)) == 0;
+        if (activePositionId != 0 || pairedToken.balanceOf(address(this)) > PAIRED_DUST_TOLERANCE) return false;
+        return address(rewardToken) == address(0) || rewardToken.balanceOf(address(this)) <= REWARD_DUST_TOLERANCE;
     }
 
+    /// @notice Guardian-only sweep of a paired-token remainder at or below
+    /// `PAIRED_DUST_TOLERANCE`. Recipient is hardcoded to `vault` — there is no
+    /// address parameter, so this cannot be used to route funds anywhere else.
+    /// Reverts above tolerance so it can never double as a limit-bypass path;
+    /// a remainder above tolerance must go through `liquidateAllWbnb` instead.
+    function sweepPairedDust() external onlyRole(GUARDIAN_ROLE) nonReentrant returns (uint256 amount) {
+        amount = pairedToken.balanceOf(address(this));
+        if (amount == 0) revert InvalidAmount();
+        if (amount > PAIRED_DUST_TOLERANCE) revert DustAboveTolerance(amount, PAIRED_DUST_TOLERANCE);
+        pairedToken.safeTransfer(vault, amount);
+        emit DustSwept(address(pairedToken), amount);
+    }
+
+    /// @notice Guardian-only sweep of a reward-token remainder at or below
+    /// `REWARD_DUST_TOLERANCE`. Same hardcoded-recipient and above-tolerance
+    /// revert guarantees as `sweepPairedDust()`.
+    function sweepRewardDust() external onlyRole(GUARDIAN_ROLE) nonReentrant returns (uint256 amount) {
+        amount = rewardToken.balanceOf(address(this));
+        if (amount == 0) revert InvalidAmount();
+        if (amount > REWARD_DUST_TOLERANCE) revert DustAboveTolerance(amount, REWARD_DUST_TOLERANCE);
+        rewardToken.safeTransfer(vault, amount);
+        emit DustSwept(address(rewardToken), amount);
+    }
+
+    /// @notice Phase 1 of a chunked open (B8-T1): swap `amountIn` USDT to WBNB and
+    /// accumulate it for the open series `jobId`. A swap leg larger than
+    /// @notice B11-T1: reserve an open series before any swap. Fixes the immutable
+    /// context (full budget, ticks, mint-deadline ceiling) and bounds the FULL
+    /// position budget by canaryOpenCap HERE — the old design capped the swap leg in
+    /// phase 1 and the budget in phase 2, measuring different quantities against one
+    /// cap, so a swap leg equal to the cap could never be minted. Ticks are validated
+    /// up front, so a bad range is rejected before any funds move.
+    function reserveOpenSeries(
+        bytes32 jobId,
+        uint256 assetBudget,
+        uint256 swapLeg,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 deadlineCeiling
+    ) external onlyRole(KEEPER_ROLE) nonReentrant {
+        if (mode != Mode.OPERATING) revert OpensDisabled(mode);
+        if (jobId == bytes32(0)) revert InvalidJobId();
+        if (activeOpenJobId != bytes32(0)) revert OpenSeriesActive(activeOpenJobId);
+        if (assetBudget == 0) revert InvalidAmount();
+        if (assetBudget > canaryOpenCap) revert CapitalCapExceeded(assetBudget, canaryOpenCap);
+        // B11-T1: fix the swap leg STRICTLY below the budget so the mint leg
+        // (assetBudget - swapLeg) is positive BY CONSTRUCTION. Chunks are bounded by
+        // swapLeg (below), so a series can never swap the whole budget.
+        if (swapLeg == 0 || swapLeg >= assetBudget) revert InvalidAmount();
+        if (deadlineCeiling < block.timestamp || deadlineCeiling > type(uint64).max) revert InvalidDeadline();
+        // Validate the ticks against the live TWAP BEFORE the first swap (was phase-2-only).
+        uint160 twapSqrt = priceGuard.twapSqrtPriceX96();
+        MainV2Geometry.validateOpenTicks(tickLower, tickUpper, minTickWidth, maxTickWidth, twapSqrt);
+        // Positive is not sufficient: a dust-sized remainder can still round one CL
+        // leg to zero and make phase 2 permanently unmintable. Prove the RESERVED
+        // plan is two-sided using the guard's conservative paired output before any
+        // swap. Runtime phase 2 repeats the check against the actual accumulated leg.
+        uint256 pairedMinimum = priceGuard.minimumOut(address(asset), address(pairedToken), swapLeg, false);
+        (uint256 assetExpected, uint256 pairedExpected) = MainV2Geometry.expectedMintAmountsAtTwap(
+            assetBudget - swapLeg, pairedMinimum, tickLower, tickUpper, twapSqrt
+        );
+        if (assetExpected == 0 || pairedExpected == 0) revert OpenNotTwoSided();
+        activeOpenJobId = jobId;
+        openSeriesContext = OpenSeriesContext({
+            assetBudget: assetBudget,
+            swapLeg: swapLeg,
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            // Safe because values above uint64 max are rejected before assignment.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            deadlineCeiling: uint64(deadlineCeiling),
+            set: true
+        });
+        emit OpenSeriesReserved(jobId, assetBudget, tickLower, tickUpper, deadlineCeiling);
+    }
+
+    /// swapPerJobCap is filled over several chunks; openPosition then mints from the
+    /// accumulated inventory. Body in the linked MainV2Open (delegatecall). Main
+    /// keeps the role + mode gate; opening (including accumulation) is OPERATING-only
+    /// — an aborted series is drained by liquidateAllWbnb, so it cannot lock funds.
+    /// A series must be reserved (reserveOpenSeries) before the first chunk.
+    function openSwapChunk(bytes32 jobId, uint32 chunkIndex, uint256 amountIn, uint256 keeperMinOut, uint256 deadline)
+        external
+        onlyRole(KEEPER_ROLE)
+        nonReentrant
+        returns (uint256 pairedOut)
+    {
+        if (mode != Mode.OPERATING) revert OpensDisabled(mode);
+        // Exactly one open series may accumulate at a time (B9-T1). The first chunk
+        // fixes the series; any other jobId is refused until it is minted or
+        // cancelled. Set before the swap so the whole tx (and this reservation) is
+        // atomic — a reverting chunk unwinds the reservation too.
+        // B11-T1: the series must be reserved first (reserveOpenSeries), which fixed
+        // the full-budget context and the jobId. openSwapChunk no longer opens a
+        // series implicitly, so no swap can run before the budget and ticks are bound.
+        bytes32 active = activeOpenJobId;
+        if (active == bytes32(0)) revert NoActiveOpenSeries();
+        if (active != jobId) revert OpenSeriesActive(active);
+        // The swap leg is bounded by the RESERVED position budget (itself <= canaryOpenCap),
+        // enforced inside MainV2Open AFTER chunk-sequencing so a duplicate/sparse chunk
+        // still reports its own error rather than the budget bound.
+        pairedOut = MainV2Open.openSwapChunk(
+            jobs,
+            usedChunks,
+            dailySwapNotional,
+            executionAdapter,
+            asset,
+            SwapChunkCall(
+                jobId,
+                chunkIndex,
+                amountIn,
+                keeperMinOut,
+                deadline,
+                activePositionId,
+                openSeriesContext.swapLeg,
+                swapPerJobCap,
+                dailySwapLimit
+            )
+        );
+        emit OpenSwapChunkExecuted(jobId, chunkIndex, amountIn, pairedOut);
+    }
+
+    /// @notice Phase 2 of a chunked open: mint from the WBNB accumulated by
+    /// openSwapChunk for `p.jobId`. No swap here. `p.swapAssetIn` /
+    /// `p.keeperPairedMinOut` are unused (kept for ABI stability). Body in the
+    /// linked MainV2Open (delegatecall); Main keeps the role + mode gate, records
+    /// the position id and emits.
     function openPosition(OpenParams calldata p)
         external
         onlyRole(KEEPER_ROLE)
         nonReentrant
         returns (uint256 positionId)
     {
-        Job storage job = _beginChunk(p.jobId, JobKind.OPEN, 0);
         if (mode != Mode.OPERATING) revert OpensDisabled(mode);
-        if (executionAdapter.main() != address(this)) revert AdapterNotBound();
-        if (activePositionId != 0) revert PositionActive();
-        uint256 inventory = pairedToken.balanceOf(address(this));
-        if (inventory != 0) revert InventoryPresent(inventory);
-        if (address(rewardToken) != address(0)) {
-            uint256 rewards = rewardToken.balanceOf(address(this));
-            if (rewards != 0) revert RewardInventoryPresent(rewards);
-        }
+        // The mint may only finalize the in-progress series and is its sole normal
+        // terminator; clearing the wrong series would strand the lock (B9-T1).
+        if (p.jobId != activeOpenJobId || p.jobId == bytes32(0)) revert NoActiveOpenSeries();
+        // B11-T1: the mint must finalize the RESERVED series with the same budget and
+        // ticks — phase 2 cannot bring its own parameters and slip past the reserve.
+        OpenSeriesContext memory ctx = openSeriesContext;
         if (
-            p.assetBudget == 0 || p.swapAssetIn == 0 || p.swapAssetIn >= p.assetBudget
-                || p.assetBudget > asset.balanceOf(address(this))
-        ) revert InvalidAmount();
-        if (p.assetBudget > canaryOpenCap) revert CapitalCapExceeded(p.assetBudget, canaryOpenCap);
-
-        _reserveSwapNotional(job, p.swapAssetIn, false);
-
-        asset.forceApprove(address(executionAdapter), p.swapAssetIn);
-        uint256 pairedOut = executionAdapter.swapAssetToPaired(p.swapAssetIn, p.keeperPairedMinOut, p.deadline, false);
-        asset.forceApprove(address(executionAdapter), 0);
-
-        uint256 assetForMint = p.assetBudget - p.swapAssetIn;
-        (uint256 assetExpected, uint256 pairedExpected) =
-            venue.previewOpenAmounts(assetForMint, pairedOut, p.tickLower, p.tickUpper);
-        if (assetExpected == 0 || pairedExpected == 0) revert OpenNotTwoSided();
-        uint256 amount0Min = _boundedLpMinimum(assetExpected, mintLossBps);
-        uint256 amount1Min = _boundedLpMinimum(pairedExpected, mintLossBps);
-
-        asset.forceApprove(address(venue), assetForMint);
-        pairedToken.forceApprove(address(venue), pairedOut);
-        positionId = venue.open(
-            IDedicatedVenue.OpenArgs({
-                assetAmount: assetForMint,
-                pairedAmount: pairedOut,
-                tickLower: p.tickLower,
-                tickUpper: p.tickUpper,
-                amount0Min: amount0Min,
-                amount1Min: amount1Min,
-                deadline: p.deadline
-            })
+            !ctx.set || p.assetBudget != ctx.assetBudget || p.tickLower != ctx.tickLower || p.tickUpper != ctx.tickUpper
+        ) revert OpenSeriesContextMismatch();
+        // Mint deadline is bounded above (was unbounded): by the series ceiling fixed
+        // at reserve, and — like closeToInventory — to block.timestamp + 600 so a stale
+        // signed mint cannot execute far in the future.
+        if (p.deadline < block.timestamp || p.deadline > block.timestamp + 600) revert InvalidDeadline();
+        if (p.deadline > ctx.deadlineCeiling) revert InvalidDeadline();
+        uint256 pairedAcquired;
+        (positionId, pairedAcquired) = MainV2Open.openPosition(
+            jobs,
+            priceGuard,
+            venue,
+            asset,
+            pairedToken,
+            rewardToken,
+            OpenCall(
+                p.jobId,
+                p.tickLower,
+                p.tickUpper,
+                p.assetBudget,
+                p.deadline,
+                activePositionId,
+                canaryOpenCap,
+                minTickWidth,
+                maxTickWidth,
+                mintLossBps,
+                PAIRED_DUST_TOLERANCE,
+                REWARD_DUST_TOLERANCE
+            )
         );
-        asset.forceApprove(address(venue), 0);
-        pairedToken.forceApprove(address(venue), 0);
-        if (positionId == 0) revert InvalidPositionId();
-
         activePositionId = positionId;
-        job.cumulativeInput = p.swapAssetIn;
-        job.cumulativeOutput = pairedOut;
-        _completeJob(job);
-        emit PositionOpened(p.jobId, positionId, p.assetBudget, pairedOut);
+        activeOpenJobId = bytes32(0);
+        delete openSeriesContext; // B11-T1: context lives and dies with the series
+        emit PositionOpened(p.jobId, positionId, p.assetBudget, pairedAcquired);
+    }
+
+    /// @notice Release the open-series lock for an ABORTED series (B9-T1). Allowed
+    /// only once the accumulated paired inventory has been drained to dust (via
+    /// liquidateAllWbnb), so a cancel cannot become another cap bypass: without the
+    /// drain check an operator could swap up to the cap, cancel, and repeat. The
+    /// job is marked COMPLETED so its chunks cannot be reused.
+    function cancelOpenSeries(bytes32 jobId) external onlyRole(KEEPER_ROLE) nonReentrant {
+        if (jobId == bytes32(0) || jobId != activeOpenJobId) revert NoActiveOpenSeries();
+        uint256 paired = pairedToken.balanceOf(address(this));
+        if (paired > PAIRED_DUST_TOLERANCE) revert InventoryPresent(paired);
+        activeOpenJobId = bytes32(0);
+        delete openSeriesContext; // B11-T1: a cancelled series leaves no budget to inherit
+        MainV2Jobs.completeJob(jobs[jobId]);
+        emit OpenSeriesCancelled(jobId);
     }
 
     function closeToInventory(bytes32 jobId, uint256 deadline, bool emergency) external nonReentrant {
         if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
         else _checkRole(KEEPER_ROLE, msg.sender);
-        Job storage job = _beginChunk(jobId, JobKind.CLOSE_TO_INVENTORY, 0);
+        // A halt must stop routine keeper activity. The guardian emergency branch
+        // and the B4-T2 recovery entrypoints stay open on purpose.
+        if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        Job storage job = MainV2Jobs.beginChunk(jobs, usedChunks, jobId, JobKind.CLOSE_TO_INVENTORY, 0);
         if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
 
         uint256 positionId = activePositionId;
@@ -1765,18 +2977,21 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
         // this also proves the finite, expiring guardian budget is active.
         priceGuard.minimumOut(WBNB, USDT, 1e18, emergency);
 
+        // The missing guard: reject the close if the live pool spot price has been
+        // pushed away from the oracle (a flash swap moves spot, not Chainlink). An
+        // honestly lagging TWAP leaves spot ~= oracle and passes. Runs before any
+        // minimum is computed.
+        _requireSpotOracleCoherence(emergency);
+
+        // Value the floor on ONE basis: the spot composition (what the close will
+        // realize) valued at the oracle. Comparing this to the actual proceeds
+        // (also spot composition, oracle-valued) measures execution slippage, not
+        // the TWAP-vs-oracle drift the old TWAP-composition floor conflated it with.
         (uint256 spotAssetExpected, uint256 spotPairedExpected) = venue.previewCloseAmounts(positionId);
-        uint160 twapSqrtPrice = priceGuard.twapSqrtPriceX96();
-        (uint256 twapAssetExpected, uint256 twapPairedExpected) =
-            venue.previewCloseAmountsAtSqrtPrice(positionId, twapSqrtPrice);
 
         uint16 lossBps = emergency ? emergencyCloseLossBps : normalCloseLossBps;
-        uint256 amount0Min = _boundedLpMinimum(spotAssetExpected, lossBps);
-        uint256 amount1Min = _boundedLpMinimum(spotPairedExpected, lossBps);
-        uint256 expectedFairValue = _fairInventoryValue(twapAssetExpected, twapPairedExpected);
-        uint256 expectedExecutionValue =
-            emergency ? _inventoryValue(twapAssetExpected, twapPairedExpected, true) : expectedFairValue;
-        uint256 aggregateFloor = FullMath.mulDiv(expectedExecutionValue, BPS - lossBps, BPS);
+        (uint256 amount0Min, uint256 amount1Min, uint256 expectedFairValue, uint256 aggregateFloor) =
+            MainV2Valuation.closePlan(priceGuard, spotAssetExpected, spotPairedExpected, lossBps, emergency);
 
         uint256 assetBefore = asset.balanceOf(address(this));
         uint256 pairedBefore = pairedToken.balanceOf(address(this));
@@ -1786,17 +3001,13 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
         venue.close(positionId, amount0Min, amount1Min, deadline);
         uint256 assetReceived = asset.balanceOf(address(this)) - assetBefore;
         uint256 pairedReceived = pairedToken.balanceOf(address(this)) - pairedBefore;
-        uint256 actualFairValue = _fairInventoryValue(assetReceived, pairedReceived);
-        uint256 actualExecutionValue =
-            emergency ? _inventoryValue(assetReceived, pairedReceived, true) : actualFairValue;
-        if (actualExecutionValue < aggregateFloor) {
-            revert CloseValueBelowFloor(aggregateFloor, actualExecutionValue);
-        }
+        uint256 actualFairValue =
+            MainV2Valuation.validateCloseProceeds(priceGuard, assetReceived, pairedReceived, emergency, aggregateFloor);
         _recordWithdrawalExecutionLoss(expectedFairValue, actualFairValue);
 
         job.cumulativeInput = expectedFairValue;
         job.cumulativeOutput = actualFairValue;
-        _completeJob(job);
+        MainV2Jobs.completeJob(job);
         emit PositionClosedToInventory(
             jobId, positionId, assetReceived, pairedReceived, amount0Min, amount1Min, emergency
         );
@@ -1813,9 +3024,100 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
         emit PositionForceUnstaked(positionId);
     }
 
-    /// @notice Atomic direct-Pancake liquidation. `chunkIndex` and `finalChunk`
-    /// are explicit and stored for restart-safe idempotency, but v1 rejects
-    /// temporal slicing: the only valid operation is chunk 0 over all WBNB.
+    // ── Emergency venue-close recovery (B4-T2) ───────────────────────────────
+    // Thin guardian-only pass-throughs that make the venue's staged close and
+    // stranded-position write-off (B4-T1) reachable in production. They do NOT
+    // gate on mode: a stuck position typically coincides with a halt, and an
+    // emergency path that switches off exactly when it is needed is no path at
+    // all. They recompute nothing — Main's only bookkeeping is `activePositionId`
+    // and the mode, reconciled explicitly where the position actually goes away
+    // (burn and write-off), so NAV never counts a phantom position.
+
+    function recoverCloseUnstake() external onlyRole(GUARDIAN_ROLE) nonReentrant {
+        uint256 positionId = activePositionId;
+        if (positionId == 0) revert NoActivePosition();
+        // Freeze the redeem batch BEFORE the first irreversible venue step (B9-T2):
+        // unstaking begins the staged close, so from here the proportion between
+        // those who exit and those who stay is fixed and queued requests can no
+        // longer be cancelled — exactly as a normal closeToInventory does. No-op
+        // when the queue is empty, so the emergency path stays passable.
+        _commitWithdrawalCycleIfQueued();
+        // Pause the vault for the manual close, mirroring closeToInventory; never
+        // weaken an existing HALTED.
+        if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
+        IVenueRecovery(address(venue)).closeUnstake(positionId);
+        emit VenueCloseStageRecovered(positionId, 1);
+    }
+
+    function recoverCloseDecrease(uint256 amount0Min, uint256 amount1Min, uint256 deadline)
+        external
+        onlyRole(GUARDIAN_ROLE)
+        nonReentrant
+    {
+        uint256 positionId = activePositionId;
+        if (positionId == 0) revert NoActivePosition();
+        if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
+        IVenueRecovery(address(venue)).closeDecrease(positionId, amount0Min, amount1Min, deadline);
+        emit VenueCloseStageRecovered(positionId, 2);
+    }
+
+    function recoverCloseCollect() external onlyRole(GUARDIAN_ROLE) nonReentrant {
+        uint256 positionId = activePositionId;
+        if (positionId == 0) revert NoActivePosition();
+        if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
+        IVenueRecovery(address(venue)).closeCollect(positionId);
+        emit VenueCloseStageRecovered(positionId, 3);
+    }
+
+    /// @notice Final stage: the position is burned and its proceeds are now Main
+    /// inventory (identical end-state to a normal close), so `activePositionId` is
+    /// cleared here — after this `totalAssetsUsdt()` values only real inventory.
+    function recoverCloseBurn() external onlyRole(GUARDIAN_ROLE) nonReentrant {
+        uint256 positionId = activePositionId;
+        if (positionId == 0) revert NoActivePosition();
+        if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
+        IVenueRecovery(address(venue)).closeBurn(positionId);
+        activePositionId = 0;
+        emit VenueCloseStageRecovered(positionId, 4);
+    }
+
+    /// @notice Abandon a position whose close cannot complete. The venue frees its
+    /// slot (returning the NFT to this contract if it was unstaked, or recording
+    /// it as stranded-in-masterchef otherwise); Main drops it from its books so
+    /// `totalAssetsUsdt()` stops valuing it — a written-off position is not counted
+    /// as NAV, phantom or otherwise. Any LP value still trapped in a returned NFT
+    /// is deliberately excluded until an admin realizes it, never over-counted.
+    /// Forces HALTED: a write-off is a serious abnormal event and must require an
+    /// explicit admin review (enableOperations) before trading resumes.
+    function writeOffStrandedPosition() external onlyRole(GUARDIAN_ROLE) nonReentrant {
+        uint256 positionId = activePositionId;
+        if (positionId == 0) revert NoActivePosition();
+        // A write-off is irreversible; freeze the redeem batch first (B9-T2) so a
+        // queued request cannot be cancelled after the position is abandoned. The
+        // abandoned LP value is deliberately excluded from NAV and not measurable
+        // here, so no discrete close-loss is recorded — see the report. No-op on an
+        // empty queue.
+        _commitWithdrawalCycleIfQueued();
+        uint256 pairedBefore = pairedToken.balanceOf(address(this));
+        uint256 stranded = IVenueRecovery(address(venue)).writeOffStrandedPosition();
+        activePositionId = 0;
+        _setMode(Mode.HALTED);
+        bool inventoryReturned = pairedToken.balanceOf(address(this)) != pairedBefore;
+        emit VenuePositionWrittenOff(positionId, stranded, inventoryReturned);
+    }
+
+    /// @notice Direct-Pancake liquidation of paired-token inventory. `chunkIndex`
+    /// and `finalChunk` support draining a remainder whose notional exceeds this
+    /// job's per-job cap headroom over several calls: when the current balance
+    /// does not fit under the remaining headroom, this call swaps only the
+    /// slice that does and leaves the rest for a later chunk (same job while
+    /// headroom remains, a fresh jobId once it is exhausted). `finalChunk`
+    /// asserts the balance has been driven down to `PAIRED_DUST_TOLERANCE` and
+    /// completes the job. `_reserveSwapNotional`'s per-job and per-day caps are
+    /// evaluated exactly as before on every call, so a chunk series only
+    /// changes how a job's notional is split across calls, never the caps
+    /// themselves — in particular the daily cap still accumulates across every
+    /// chunk of every job, so a series of small calls cannot exceed it.
     function liquidateAllWbnb(
         bytes32 jobId,
         uint32 chunkIndex,
@@ -1826,30 +3128,41 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
     ) external nonReentrant returns (uint256 amountOut) {
         if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
         else _checkRole(KEEPER_ROLE, msg.sender);
-        if (chunkIndex != 0 || !finalChunk) revert SlicingDisabled();
-        Job storage job = _beginChunk(jobId, JobKind.LIQUIDATE_WBNB, chunkIndex);
-
-        uint256 amountIn = pairedToken.balanceOf(address(this));
-        if (amountIn == 0) revert InvalidAmount();
-        uint256 notional = priceGuard.fairValue(WBNB, USDT, amountIn);
-        _reserveSwapNotional(job, notional, emergency);
-
-        pairedToken.forceApprove(address(executionAdapter), amountIn);
-        amountOut = executionAdapter.swapPairedToAsset(amountIn, keeperMinOut, deadline, emergency);
-        pairedToken.forceApprove(address(executionAdapter), 0);
-        uint256 remaining = pairedToken.balanceOf(address(this));
-        if (remaining != 0) revert InventoryRemaining(remaining);
+        if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        // Body in the linked MainV2Liquidation (EIP-170); it runs via delegatecall,
+        // so token balances/approvals and the mapping pointers act on this
+        // contract. Main keeps the role/halt gate and the loss journal + event.
+        uint256 amountIn;
+        uint256 notional;
+        (amountOut, amountIn, notional) = MainV2Liquidation.liquidateWbnb(
+            jobs,
+            usedChunks,
+            dailySwapNotional,
+            pairedToken,
+            executionAdapter,
+            priceGuard,
+            LiqParams(
+                jobId,
+                chunkIndex,
+                keeperMinOut,
+                deadline,
+                finalChunk,
+                emergency,
+                hardMaxActiveAssets,
+                swapPerJobCap,
+                dailySwapLimit,
+                PAIRED_DUST_TOLERANCE
+            )
+        );
         _recordWithdrawalExecutionLoss(notional, amountOut);
-
-        job.cumulativeInput = amountIn;
-        job.cumulativeOutput = amountOut;
-        _completeJob(job);
         emit WbnbLiquidated(jobId, amountIn, amountOut, emergency);
     }
 
-    /// @notice Atomic direct-Pancake liquidation of all canonical CAKE.
-    /// It is a separate durable job so reward failures cannot block LP close
-    /// or WBNB realization. Temporal slicing remains disabled in MainV2 v1.
+    /// @notice Direct-Pancake liquidation of all canonical CAKE reward inventory.
+    /// It is a separate durable job so reward failures cannot block LP close or
+    /// WBNB realization. Chunking follows the same headroom-based slicing as
+    /// `liquidateAllWbnb`; see that function's NatSpec for the mechanics and the
+    /// daily-cap preservation argument.
     function liquidateAllReward(
         bytes32 jobId,
         uint32 chunkIndex,
@@ -1860,108 +3173,108 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
     ) external nonReentrant returns (uint256 amountOut) {
         if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
         else _checkRole(KEEPER_ROLE, msg.sender);
-        if (chunkIndex != 0 || !finalChunk) revert SlicingDisabled();
-        Job storage job = _beginChunk(jobId, JobKind.LIQUIDATE_REWARD, chunkIndex);
-
-        uint256 amountIn = rewardToken.balanceOf(address(this));
-        if (amountIn == 0) revert InvalidAmount();
-        uint256 notional = rewardPriceGuard.fairValue(amountIn);
-        _reserveSwapNotional(job, notional, emergency);
-
-        rewardToken.forceApprove(address(rewardExecutionAdapter), amountIn);
-        amountOut = rewardExecutionAdapter.swapRewardToAsset(amountIn, keeperMinOut, deadline, emergency);
-        rewardToken.forceApprove(address(rewardExecutionAdapter), 0);
-        uint256 remaining = rewardToken.balanceOf(address(this));
-        if (remaining != 0) revert RewardInventoryRemaining(remaining);
+        if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        // Body in the linked MainV2Liquidation (EIP-170), same delegatecall
+        // arrangement as liquidateAllWbnb.
+        uint256 amountIn;
+        uint256 notional;
+        (amountOut, amountIn, notional) = MainV2Liquidation.liquidateReward(
+            jobs,
+            usedChunks,
+            dailySwapNotional,
+            rewardToken,
+            rewardExecutionAdapter,
+            rewardPriceGuard,
+            LiqParams(
+                jobId,
+                chunkIndex,
+                keeperMinOut,
+                deadline,
+                finalChunk,
+                emergency,
+                hardMaxActiveAssets,
+                swapPerJobCap,
+                dailySwapLimit,
+                REWARD_DUST_TOLERANCE
+            )
+        );
         _recordWithdrawalExecutionLoss(notional, amountOut);
-
-        job.cumulativeInput = amountIn;
-        job.cumulativeOutput = amountOut;
-        _completeJob(job);
         emit RewardLiquidated(jobId, amountIn, amountOut, emergency);
     }
 
-    function totalAssetsUsdt() public view returns (uint256 total) {
-        total = asset.balanceOf(address(this));
-        uint256 paired = pairedToken.balanceOf(address(this));
-        if (paired != 0) total += priceGuard.minimumOut(WBNB, USDT, paired, false);
-        if (activePositionId != 0) {
-            // A one-sided-USDT position would otherwise bypass the oracle
-            // cross-check because there is no WBNB amount to value below.
-            priceGuard.minimumOut(WBNB, USDT, 1e18, false);
-            uint160 twapSqrtPrice = priceGuard.twapSqrtPriceX96();
-            (uint256 positionAsset, uint256 positionPaired) =
-                venue.previewCloseAmountsAtSqrtPrice(activePositionId, twapSqrtPrice);
-            total += positionAsset;
-            if (positionPaired != 0) {
-                total += priceGuard.minimumOut(WBNB, USDT, positionPaired, false);
-            }
-        }
-        uint256 rewards = rewardToken.balanceOf(address(this));
-        if (rewards != 0) total += rewardPriceGuard.minimumOut(rewards, false);
+    /// @notice Revenue-conservative NAV in USDT (minimumOut haircut + the LOWER of
+    /// the TWAP/spot geometry for the active position). Computation lives in the
+    /// linked `MainV2Valuation` (EIP-170); all balances/state are read here and
+    /// passed in. min() can UNDER-value NAV on an honest TWAP/spot divergence,
+    /// which dilutes incoming depositors (frozen while a redeem cycle is
+    /// committed), the opposite of the risk we guard — deliberate and accepted.
+    function totalAssetsUsdt() public view returns (uint256) {
+        return MainV2Valuation.totalAssetsUsdt(
+            venue,
+            priceGuard,
+            rewardPriceGuard,
+            asset.balanceOf(address(this)),
+            pairedToken.balanceOf(address(this)),
+            rewardToken.balanceOf(address(this)),
+            activePositionId
+        );
+    }
+
+    /// @notice Deposit-conservative NAV (B10-T2): same oracle-valued legs as
+    /// `totalAssetsUsdt`, but the active position uses the HIGHER of the TWAP/spot
+    /// geometry so a downward spot push cannot under-value NAV and mint a depositor
+    /// cheap shares. Consumed only by the vault's deposit/mint pricing; redemptions,
+    /// reporting and the async claim keep using the min-based `totalAssetsUsdt`.
+    function totalAssetsUsdtUpper() public view returns (uint256) {
+        return MainV2Valuation.totalAssetsUsdtUpper(
+            venue,
+            priceGuard,
+            rewardPriceGuard,
+            asset.balanceOf(address(this)),
+            pairedToken.balanceOf(address(this)),
+            rewardToken.balanceOf(address(this)),
+            activePositionId
+        );
     }
 
     function rewardInventory() external view returns (uint256) {
         return rewardToken.balanceOf(address(this));
     }
 
-    function _inventoryValue(uint256 assetAmount, uint256 pairedAmount, bool emergency)
-        internal
-        view
-        returns (uint256 value)
-    {
-        value = assetAmount;
-        if (pairedAmount != 0) {
-            value += emergency
-                ? priceGuard.minimumOut(WBNB, USDT, pairedAmount, true)
-                : priceGuard.fairValue(WBNB, USDT, pairedAmount);
-        }
+    /// @notice Exposure of the strategy in USDT for the capital ceiling: fair-mid
+    /// valued (no minimumOut haircut) and, for the active position, the HIGHER of
+    /// the TWAP/spot geometry. Both choices point the same way — never understate
+    /// exposure — the opposite of the revenue-conservative `totalAssetsUsdt`.
+    function _fundingExposureUsdt() internal view returns (uint256) {
+        return MainV2Valuation.fundingExposureUsdt(
+            venue,
+            priceGuard,
+            rewardPriceGuard,
+            asset.balanceOf(address(this)),
+            pairedToken.balanceOf(address(this)),
+            rewardToken.balanceOf(address(this)),
+            activePositionId
+        );
     }
 
-    function _fairInventoryValue(uint256 assetAmount, uint256 pairedAmount) internal view returns (uint256 value) {
-        value = assetAmount;
-        if (pairedAmount != 0) value += priceGuard.fairValue(WBNB, USDT, pairedAmount);
+    /// @notice Revert if the live pool spot price deviates from the oracle price
+    /// by more than the allowed band. Reads spot from the pool via the venue;
+    /// oracle price is the guard's fair USDT value of 1 WBNB.
+    function _requireSpotOracleCoherence(bool emergency) internal view {
+        MainV2Valuation.requireSpotOracleCoherence(
+            venue, priceGuard, maxSpotOracleDeviationBps, emergencySpotOracleDeviationBps, emergency
+        );
     }
 
-    function _boundedLpMinimum(uint256 expected, uint16 lossBps) internal pure returns (uint256) {
-        if (expected == 0) return 0;
-        uint256 minimum = FullMath.mulDiv(expected, BPS - lossBps, BPS);
-        return minimum == 0 ? 1 : minimum;
-    }
+    // Pure tick/LP geometry (`usdtPerWbnbFromSqrt`, `boundedLpMinimum`,
+    // `validateOpenTicks`, `expectedMintAmountsAtTwap`) moved verbatim to the
+    // linked library `MainV2Geometry` to keep `Main` under EIP-170. Behaviour is
+    // unchanged; the TWAP/state reads stay on this side and are passed in.
 
-    function _beginChunk(bytes32 jobId, JobKind kind, uint32 chunkIndex) internal returns (Job storage job) {
-        if (jobId == bytes32(0)) revert InvalidJobId();
-        job = jobs[jobId];
-        if (job.status == JobStatus.NONE) {
-            job.kind = kind;
-            job.status = JobStatus.ACTIVE;
-            job.createdAt = uint64(block.timestamp);
-        } else {
-            if (job.kind != kind) revert JobKindMismatch(job.kind, kind);
-            if (job.status == JobStatus.COMPLETED) revert JobAlreadyCompleted();
-        }
-        if (usedChunks[jobId][chunkIndex]) revert DuplicateChunk(chunkIndex);
-        usedChunks[jobId][chunkIndex] = true;
-        job.chunks += 1;
-    }
-
-    function _completeJob(Job storage job) internal {
-        job.status = JobStatus.COMPLETED;
-        job.completedAt = uint64(block.timestamp);
-    }
-
-    function _reserveSwapNotional(Job storage job, uint256 notional, bool emergency) internal {
-        uint256 jobTotal = job.cumulativeNotionalAsset + notional;
-        uint256 jobCap = emergency ? hardMaxActiveAssets : swapPerJobCap;
-        if (jobTotal > jobCap) revert SwapCapExceeded(jobTotal, jobCap);
-        job.cumulativeNotionalAsset = jobTotal;
-        if (emergency) return;
-
-        uint64 day = uint64(block.timestamp / 1 days);
-        uint256 dayTotal = dailySwapNotional[day] + notional;
-        if (dayTotal > dailySwapLimit) revert DailySwapCapExceeded(dayTotal, dailySwapLimit);
-        dailySwapNotional[day] = dayTotal;
-    }
+    // Job lifecycle + chunk accounting (`beginChunk`/`completeJob`/
+    // `reserveSwapNotional`) moved verbatim to the linked library `MainV2Jobs`
+    // (EIP-170). Behaviour is unchanged; the jobs/usedChunks/dailySwapNotional
+    // mappings are passed by storage reference and the caps by value.
 
     function _setMode(Mode newMode) internal {
         Mode oldMode = mode;
@@ -1969,9 +3282,20 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard {
         emit ModeChanged(oldMode, newMode);
     }
 
+    /// @notice Auto-commit the queued batch when a keeper begins an inventory
+    /// close with requests outstanding. This mirrors the explicit
+    /// `commitWithdrawalCycle`: both the commit flag AND the batch flag are set
+    /// together. Setting only the commit flag would leave the batch flag false,
+    /// which (a) silently disables the execution-loss journal for the very close
+    /// that motivates the cycle and (b) bricks a later `commitWithdrawalCycle`
+    /// (it reverts forever on the one-way commit guard). The vault's batch
+    /// settlement also requires the batch flag, so the two flags must move
+    /// together on every commit path.
     function _commitWithdrawalCycleIfQueued() internal {
         if (queuedWithdrawalCount == 0 || withdrawalCycleCommitted) return;
+        IVaultBWithdrawalCycleCommitReceiver(vault).prepareWithdrawalCycleCommit();
         withdrawalCycleCommitted = true;
+        withdrawalCycleBatchCommitted = true;
         emit WithdrawalCycleCommitted(queuedWithdrawalCount);
     }
 

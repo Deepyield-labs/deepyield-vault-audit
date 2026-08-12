@@ -117,10 +117,19 @@ interface IChainlinkAggregatorV3 {
 }
 
 interface IVaultBPriceGuard {
+    function POOL_FEE() external view returns (uint24);
+
     function minimumOut(address tokenIn, address tokenOut, uint256 amountIn, bool emergency)
         external
         view
         returns (uint256 minOut);
+
+    function minimumOutAndBudget(address tokenIn, address tokenOut, uint256 amountIn, bool emergency)
+        external
+        view
+        returns (uint256 minOut, uint256 emergencyNotional, bool emergencyBudgetUsed);
+
+    function consumeEmergencyNotional(uint256 notional) external;
 
     function fairValue(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256 amountOut);
 
@@ -142,7 +151,16 @@ interface IVaultBExecutionAdapterV2 {
 }
 
 interface IVaultBRewardPriceGuard {
+    function DIRECT_ORACLE_FEE() external view returns (uint24);
+
     function minimumOut(uint256 amountIn, bool emergency) external view returns (uint256 minOut);
+
+    function minimumOutAndBudget(uint256 amountIn, bool emergency)
+        external
+        view
+        returns (uint256 minOut, uint256 emergencyNotional, bool emergencyBudgetUsed);
+
+    function consumeEmergencyNotional(uint256 notional) external;
 
     function fairValue(uint256 amountIn) external view returns (uint256 amountOut);
 }
@@ -563,6 +581,8 @@ contract BoundedPancakeExecutionAdapterV2 is IVaultBExecutionAdapterV2 {
 
     error WrongChain(uint256 actual);
     error ZeroAddress();
+    error InvalidPriceGuard();
+    error PoolFeeMismatch(uint24 adapterFee, uint24 guardFee);
     error NotBinder();
     error AlreadyBound();
     error InvalidMain();
@@ -581,7 +601,8 @@ contract BoundedPancakeExecutionAdapterV2 is IVaultBExecutionAdapterV2 {
         uint256 keeperMinOut,
         uint256 guardMinOut,
         uint256 effectiveMinOut,
-        bool emergency
+        bool emergency,
+        bool emergencyBudgetUsed
     );
 
     event MainBound(address indexed main);
@@ -589,6 +610,9 @@ contract BoundedPancakeExecutionAdapterV2 is IVaultBExecutionAdapterV2 {
     constructor(address binder_, IVaultBPriceGuard priceGuard_, uint32 maxDeadlineDelay_) {
         if (block.chainid != 56) revert WrongChain(block.chainid);
         if (binder_ == address(0) || address(priceGuard_) == address(0)) revert ZeroAddress();
+        if (address(priceGuard_).code.length == 0) revert InvalidPriceGuard();
+        uint24 guardFee = priceGuard_.POOL_FEE();
+        if (guardFee != POOL_FEE) revert PoolFeeMismatch(POOL_FEE, guardFee);
         if (maxDeadlineDelay_ == 0 || maxDeadlineDelay_ > 600) revert InvalidDeadline();
         binder = binder_;
         priceGuard = priceGuard_;
@@ -596,6 +620,9 @@ contract BoundedPancakeExecutionAdapterV2 is IVaultBExecutionAdapterV2 {
     }
 
     function bindMain(address main_) external {
+        // Intentionally one-shot. A bad pre-deployment binding is recovered by
+        // redeploying this small adapter; runtime rotation would create a larger
+        // authority surface over funds approved by Main.
         if (msg.sender != binder) revert NotBinder();
         if (main != address(0)) revert AlreadyBound();
         if (main_ == address(0) || main_.code.length == 0) revert InvalidMain();
@@ -637,7 +664,8 @@ contract BoundedPancakeExecutionAdapterV2 is IVaultBExecutionAdapterV2 {
             revert InvalidDeadline();
         }
 
-        uint256 guardMinOut = priceGuard.minimumOut(tokenIn, tokenOut, amountIn, emergency);
+        (uint256 guardMinOut, uint256 emergencyNotional, bool emergencyBudgetUsed) =
+            priceGuard.minimumOutAndBudget(tokenIn, tokenOut, amountIn, emergency);
         uint256 effectiveMinOut = keeperMinOut > guardMinOut ? keeperMinOut : guardMinOut;
 
         IERC20 input = IERC20(tokenIn);
@@ -663,6 +691,9 @@ contract BoundedPancakeExecutionAdapterV2 is IVaultBExecutionAdapterV2 {
             );
         input.forceApprove(PANCAKE_V3_SWAP_ROUTER, 0);
 
+        // Exact equality is deliberate for the fixed BSC USDT/WBNB pair. Both
+        // deployed tokens were verified non-rebasing and non-fee-on-transfer;
+        // relaxing this would hide real router/accounting mismatches.
         uint256 adapterInputAfter = input.balanceOf(address(this));
         if (adapterInputAfter != adapterInputBefore) {
             revert InputNotFullySpent(adapterInputAfter - adapterInputBefore);
@@ -676,6 +707,18 @@ contract BoundedPancakeExecutionAdapterV2 is IVaultBExecutionAdapterV2 {
         if (amountOut != reportedOut) revert RouterOutputMismatch(reportedOut, amountOut);
         if (amountOut < effectiveMinOut) revert RouterOutputMismatch(effectiveMinOut, amountOut);
 
-        emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut, keeperMinOut, guardMinOut, effectiveMinOut, emergency);
+        if (emergencyBudgetUsed) priceGuard.consumeEmergencyNotional(emergencyNotional);
+
+        emit SwapExecuted(
+            tokenIn,
+            tokenOut,
+            amountIn,
+            amountOut,
+            keeperMinOut,
+            guardMinOut,
+            effectiveMinOut,
+            emergency,
+            emergencyBudgetUsed
+        );
     }
 }

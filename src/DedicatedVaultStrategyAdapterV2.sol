@@ -13,6 +13,11 @@ import {IFeeSink} from "./interfaces/IFeeSink.sol";
 
 interface IVaultBReserveView {
     function totalAssets() external view returns (uint256);
+    function totalClaimableAssets() external view returns (uint256);
+}
+
+interface IVaultBRedeemCycleCommit {
+    function prepareRedeemCycleCommit() external;
 }
 
 /// @notice Vault B ERC-4626 bridge for MainV2. Egress is restricted to the
@@ -36,8 +41,15 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
 
     uint256 public accountedAssets;
     uint256 public panicNonce;
+    /// @notice Fee assets pulled from Main but not yet accepted by the fee sink
+    /// (the sink reverted). Held in this adapter as an obligation owed to
+    /// `feeRecipient` and remitted later via `remitFee()`. Excluded from vault
+    /// NAV: it lives in this adapter's own balance, which `estimatedTotalAssets`
+    /// (Main assets only) does not count.
+    uint256 public unremittedFee;
 
     error NotVault();
+    error NotMain();
     error ZeroAddress();
     error FeeTooHigh();
     error TransferMismatch(uint256 expected, uint256 actual);
@@ -49,6 +61,8 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
     event WithdrawnToVault(uint256 assets);
     event WithdrawalForwarded(bytes32 indexed requestId, uint256 assets, uint256 feeAssets);
     event PerformanceFeeCharged(uint256 realizedProfit, uint256 feeAssets);
+    event FeeRemittanceDeferred(uint256 amount, uint256 totalUnremitted);
+    event FeeRemitted(uint256 amount);
 
     modifier onlyVault() {
         if (msg.sender != vault) revert NotVault();
@@ -100,7 +114,9 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         _crystallizeFeeDirect();
         withdrawn = _pullIdle(assetsNeeded);
         asset.safeTransfer(vault, withdrawn);
-        _reduceBasis(withdrawn);
+        // Resync basis to Main's actual remaining idle (covers the loss path,
+        // where the old flat subtraction left a stale, too-high basis).
+        accountedAssets = asset.balanceOf(address(main));
         emit WithdrawnToVault(withdrawn);
     }
 
@@ -112,6 +128,14 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         main.commitWithdrawalCycle();
     }
 
+    /// @notice Canonical Main callback used immediately before an automatic
+    /// withdrawal-cycle commit. It makes the Vault snapshot authoritative before
+    /// Main starts an irreversible close step.
+    function prepareWithdrawalCycleCommit() external {
+        if (msg.sender != address(main)) revert NotMain();
+        IVaultBRedeemCycleCommit(vault).prepareRedeemCycleCommit();
+    }
+
     /// @notice Pull exactly the claim-time shortfall plus any accrued realized
     /// fee in one Main request. The user amount goes only to the vault; the fee
     /// goes only to the immutable fee recipient.
@@ -121,7 +145,6 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         nonReentrant
         returns (uint256 withdrawn)
     {
-        uint256 idleBefore = asset.balanceOf(address(main));
         (uint256 profit, uint256 feeAssets) = pendingPerformanceFee();
         uint256 pullAmount = assetsNeeded + feeAssets;
         uint256 beforeBalance = asset.balanceOf(address(this));
@@ -130,12 +153,17 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         if (received != pullAmount) revert TransferMismatch(pullAmount, received);
 
         if (profit != 0) {
-            accountedAssets = idleBefore - feeAssets;
+            // Fee is decoupled from the withdrawal: _payFee never reverts the
+            // user's exit; on a sink failure it accrues to unremittedFee.
             _payFee(feeAssets);
             emit PerformanceFeeCharged(profit, feeAssets);
         }
         if (assetsNeeded != 0) asset.safeTransfer(vault, assetsNeeded);
-        _reduceBasis(assetsNeeded);
+        // Resync basis to Main's actual remaining idle after this withdrawal and
+        // any realized fee that left Main — for BOTH profit and loss paths. The
+        // realized fee left Main whether or not the sink accepted it, so the
+        // deferred obligation is never counted into the basis twice.
+        accountedAssets = asset.balanceOf(address(main));
         emit WithdrawalForwarded(requestId, assetsNeeded, feeAssets);
         return assetsNeeded;
     }
@@ -180,8 +208,16 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
     }
 
     function depositsAllowed() external view returns (bool) {
-        return main.mode() == DedicatedVaultMainV2.Mode.OPERATING && !main.withdrawalCycleCommitted()
-            && main.activePositionId() == 0;
+        if (
+            main.mode() != DedicatedVaultMainV2.Mode.OPERATING || main.withdrawalCycleCommitted()
+                || !main.isWithdrawalReady()
+        ) return false;
+        (, uint256 feeAssets) = pendingPerformanceFee();
+        return feeAssets == 0;
+    }
+
+    function depositAssetSource() external view returns (address) {
+        return address(main);
     }
 
     function minimumVaultIdleAssets() public view returns (uint256) {
@@ -190,8 +226,11 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
 
     function maxDeployableAssets() public view returns (uint256) {
         uint256 idle = asset.balanceOf(vault);
+        uint256 claimable = IVaultBReserveView(vault).totalClaimableAssets();
+        if (idle <= claimable) return 0;
+        uint256 shareholderIdle = idle - claimable;
         uint256 reserve = minimumVaultIdleAssets();
-        return idle > reserve ? idle - reserve : 0;
+        return shareholderIdle > reserve ? shareholderIdle - reserve : 0;
     }
 
     function managerWithdrawAll() external onlyRole(MANAGER_ROLE) nonReentrant returns (uint256 withdrawn) {
@@ -233,6 +272,18 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         return estimatedGrossAssets() - feeAssets;
     }
 
+    /// @notice Deposit-conservative gross assets (B10-T2): the upper (max TWAP/spot)
+    /// NAV. `estimatedGrossAssetsUpper() >= estimatedGrossAssets()` always (max >=
+    /// min), so subtracting the same pending fee never underflows.
+    function estimatedGrossAssetsUpper() public view returns (uint256) {
+        return main.totalAssetsUsdtUpper();
+    }
+
+    function estimatedTotalAssetsUpper() external view returns (uint256) {
+        (, uint256 feeAssets) = pendingPerformanceFee();
+        return estimatedGrossAssetsUpper() - feeAssets;
+    }
+
     function _crystallizeFeeDirect() internal returns (uint256 profit, uint256 feeAssets) {
         (profit, feeAssets) = pendingPerformanceFee();
         if (profit == 0) return (0, 0);
@@ -263,17 +314,39 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         if (received != pulled) revert TransferMismatch(pulled, received);
     }
 
-    function _reduceBasis(uint256 withdrawn) internal {
-        accountedAssets = withdrawn >= accountedAssets ? 0 : accountedAssets - withdrawn;
-    }
-
     function _payFee(uint256 amount) internal {
         if (amount == 0) return;
         uint256 beforeBalance = asset.balanceOf(address(this));
         asset.forceApprove(feeRecipient, amount);
-        feeSink.recordFee(amount);
+        try feeSink.recordFee(amount) {
+            asset.forceApprove(feeRecipient, 0);
+            uint256 paid = beforeBalance - asset.balanceOf(address(this));
+            if (paid != amount) revert FeeSinkPullMismatch(amount, paid);
+        } catch {
+            // Sink unavailable (paused, blacklist, treasury-mode, or a bug):
+            // do NOT revert the user's withdrawal. Keep the fee assets in this
+            // adapter as an obligation and remit them later via remitFee().
+            asset.forceApprove(feeRecipient, 0);
+            unremittedFee += amount;
+            emit FeeRemittanceDeferred(amount, unremittedFee);
+        }
+    }
+
+    /// @notice Remit previously-deferred fee assets to the immutable fee
+    /// recipient. Permissionless: the sink pulls under a scoped approval, so
+    /// funds can only ever reach `feeRecipient` — there is no misroute vector.
+    /// Reverts if the sink still fails, which restores the obligation, so a fee
+    /// is paid exactly once across any number of retries.
+    function remitFee() external nonReentrant returns (uint256 remitted) {
+        remitted = unremittedFee;
+        if (remitted == 0) return 0;
+        unremittedFee = 0;
+        uint256 beforeBalance = asset.balanceOf(address(this));
+        asset.forceApprove(feeRecipient, remitted);
+        feeSink.recordFee(remitted);
         asset.forceApprove(feeRecipient, 0);
         uint256 paid = beforeBalance - asset.balanceOf(address(this));
-        if (paid != amount) revert FeeSinkPullMismatch(amount, paid);
+        if (paid != remitted) revert FeeSinkPullMismatch(remitted, paid);
+        emit FeeRemitted(remitted);
     }
 }

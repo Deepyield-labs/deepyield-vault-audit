@@ -47,6 +47,7 @@ contract DeployVaultBV2 is Script {
         uint16 normalSwapLossBps;
         uint16 maxEmergencySwapLossBps;
         uint16 maxOracleDeviationBps;
+        uint16 maxEmergencyOracleDeviationBps;
         uint16 mintLossBps;
         uint16 normalCloseLossBps;
         uint16 emergencyCloseLossBps;
@@ -116,6 +117,9 @@ contract DeployVaultBV2 is Script {
             cfg.vaultDepositCap
         );
         PartnerRegistry registry = new PartnerRegistry(address(vault), cfg.admin);
+        // Partner wrappers/factory are intentionally outside the Vault B V2
+        // deployment. The registry remains factory-unbound and empty; the
+        // splitter is retained only as the typed, failure-isolated fee sink.
         PartnerAttributedSplitter splitter =
             new PartnerAttributedSplitter(address(registry), cfg.projectTreasury, cfg.partnerShareBps, cfg.admin);
 
@@ -123,6 +127,7 @@ contract DeployVaultBV2 is Script {
             cfg.normalSwapLossBps,
             cfg.maxEmergencySwapLossBps,
             cfg.maxOracleDeviationBps,
+            cfg.maxEmergencyOracleDeviationBps,
             cfg.twapWindow,
             cfg.maxBnbFeedAge,
             cfg.maxUsdtFeedAge,
@@ -137,6 +142,7 @@ contract DeployVaultBV2 is Script {
             cfg.normalSwapLossBps,
             cfg.maxEmergencySwapLossBps,
             cfg.maxOracleDeviationBps,
+            cfg.maxEmergencyOracleDeviationBps,
             cfg.maxNormalCakeNotional,
             cfg.maxEmergencyCakeNotional,
             cfg.twapWindow,
@@ -149,6 +155,8 @@ contract DeployVaultBV2 is Script {
         BoundedPancakeRewardAdapterV2 cakeExecutor = new BoundedPancakeRewardAdapterV2(
             deployer, IVaultBRewardPriceGuard(address(cakeGuard)), cfg.maxSwapDeadlineDelay
         );
+        wbnbGuard.grantRole(wbnbGuard.EMERGENCY_CONSUMER_ROLE(), address(wbnbExecutor));
+        cakeGuard.grantRole(cakeGuard.EMERGENCY_CONSUMER_ROLE(), address(cakeExecutor));
 
         uint64 base = vm.getNonce(deployer);
         address predictedVenue = vm.computeCreateAddress(deployer, base);
@@ -238,6 +246,8 @@ contract DeployVaultBV2 is Script {
             _checkedUint16(vm.parseJsonUint(j, ".maxEmergencySwapLossBps"), ".maxEmergencySwapLossBps");
         cfg.maxOracleDeviationBps =
             _checkedUint16(vm.parseJsonUint(j, ".maxOracleDeviationBps"), ".maxOracleDeviationBps");
+        cfg.maxEmergencyOracleDeviationBps =
+            _checkedUint16(vm.parseJsonUint(j, ".maxEmergencyOracleDeviationBps"), ".maxEmergencyOracleDeviationBps");
         cfg.mintLossBps = _checkedUint16(vm.parseJsonUint(j, ".mintLossBps"), ".mintLossBps");
         cfg.normalCloseLossBps = _checkedUint16(vm.parseJsonUint(j, ".normalCloseLossBps"), ".normalCloseLossBps");
         cfg.emergencyCloseLossBps =

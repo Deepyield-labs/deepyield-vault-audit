@@ -90,7 +90,12 @@ contract VaultBWithdrawalBatchRemediationTest is VaultBAsyncRedeemV2Test {
         assertFalse(main.withdrawalCycleCommitted());
     }
 
-    function testProtocolCloseCommitsQueueWithoutMarkingItBatchFunded() public {
+    /// B3-T1 (п.6): a keeper's routine LP close that auto-commits a waiting batch
+    /// must set BOTH the commit flag and the batch flag, arming the execution-loss
+    /// journal for the very close that motivated the cycle. Before the fix the
+    /// batch flag stayed false — the journal was silently disabled and a later
+    /// `commitWithdrawalCycle` would revert forever.
+    function testProtocolCloseAutoCommitsBatchAndArmsLossJournal() public {
         _depositAndDeploy(alice, 1_000e18);
         _open();
         uint256 minimum = vault.MIN_REDEEM_SHARES();
@@ -102,13 +107,21 @@ contract VaultBWithdrawalBatchRemediationTest is VaultBAsyncRedeemV2Test {
         guard.setFail(false);
         uint256 assetIn = venue.lastAssetIn();
         uint256 pairedIn = venue.lastPairedIn();
-        venue.configureClose(assetIn, pairedIn, assetIn, pairedIn, assetIn * 99 / 100, pairedIn * 99 / 100);
+        uint256 assetOut = assetIn * 99 / 100;
+        uint256 pairedOut = pairedIn * 99 / 100;
+        venue.configureClose(assetIn, pairedIn, assetIn, pairedIn, assetOut, pairedOut);
         vm.prank(keeper);
         main.closeToInventory(keccak256("CLOSE_WITH_PENDING_BATCH"), block.timestamp + 60, false);
 
         assertTrue(main.withdrawalCycleCommitted());
-        assertFalse(main.withdrawalCycleBatchCommitted());
-        assertEq(main.withdrawalCycleExecutionLoss(), 0, "protocol close cost is not charged to a waiting batch");
+        assertTrue(main.withdrawalCycleBatchCommitted(), "auto-commit also marks the batch, arming the loss journal");
+        assertGt(vault.redeemCycleCommittedAt(), 0, "Vault recovery clock is frozen before Main commits");
+        assertEq(vault.redeemCycleCommittedShares(), vault.outstandingRedeemShares());
+        assertEq(
+            main.withdrawalCycleExecutionLoss(),
+            (assetIn - assetOut) + (pairedIn - pairedOut),
+            "the auto-committed close records its measured execution loss"
+        );
         assertTrue(vault.redeemCycleCommitted());
         vm.prank(bob);
         vm.expectRevert(DeepYieldVaultB.RedeemCycleLocked.selector);

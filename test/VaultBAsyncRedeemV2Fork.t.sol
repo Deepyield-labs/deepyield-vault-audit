@@ -2,6 +2,7 @@
 pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ForkBlock} from "./ForkBlock.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -65,17 +66,23 @@ contract VaultBAsyncRedeemV2ForkTest is Test {
     DedicatedVaultStrategyAdapterV2 internal adapter;
 
     function setUp() public {
-        vm.createSelectFork(vm.rpcUrl("bsc"));
+        // Pin the fork block, or cleanly skip if the RPC can't serve it (see ForkBlock).
+        if (!ForkBlock.selectBscFork(vm)) return;
         feeRecipient = address(new MockVaultBFeeSinkFork(IERC20(USDT)));
         vault = new DeepYieldVaultB(
             IERC20(USDT), "DeepYield Vault B V2", "dyBV2", admin, guardian, feeRecipient, 50_000e18
         );
-        guard = new VaultBPriceGuard(100, 1_000, 500, 1_800, 3_600, 90_000, 600, admin, guardian);
+        guard = new VaultBPriceGuard(100, 1_000, 500, 1_000, 1_800, 3_600, 90_000, 600, admin, guardian);
         executor = new BoundedPancakeExecutionAdapterV2(address(this), IVaultBPriceGuard(address(guard)), 120);
-        rewardGuard =
-            new VaultBCakePriceGuard(100, 1_000, 500, 5_100e18, 50_000e18, 1_800, 3_600, 90_000, 600, admin, guardian);
+        rewardGuard = new VaultBCakePriceGuard(
+            100, 1_000, 500, 1_000, 5_100e18, 50_000e18, 1_800, 3_600, 90_000, 600, admin, guardian
+        );
         rewardExecutor =
             new BoundedPancakeRewardAdapterV2(address(this), IVaultBRewardPriceGuard(address(rewardGuard)), 120);
+        vm.startPrank(admin);
+        guard.grantRole(guard.EMERGENCY_CONSUMER_ROLE(), address(executor));
+        rewardGuard.grantRole(rewardGuard.EMERGENCY_CONSUMER_ROLE(), address(rewardExecutor));
+        vm.stopPrank();
 
         uint64 base = vm.getNonce(address(this));
         address predictedVenue = vm.computeCreateAddress(address(this), base);
@@ -143,6 +150,18 @@ contract VaultBAsyncRedeemV2ForkTest is Test {
         (, int24 tick,,,,,) = IVaultBAsyncPoolFork(POOL).slot0();
         int24 spacing = IVaultBAsyncPoolFork(POOL).tickSpacing();
         int24 center = tick / spacing * spacing;
+        // B8-T1 two-phase open: swap the paired leg, then mint (B9-T1 series lock).
+        vm.prank(keeper);
+        main.reserveOpenSeries(
+            keccak256("async-fork-open"),
+            deployable,
+            deployable / 2,
+            center - 70 * spacing,
+            center + 70 * spacing,
+            block.timestamp + 60
+        ); // B11-T1
+        vm.prank(keeper);
+        main.openSwapChunk(keccak256("async-fork-open"), 0, deployable / 2, 1, block.timestamp + 60);
         vm.prank(keeper);
         main.openPosition(
             DedicatedVaultMainV2.OpenParams({
