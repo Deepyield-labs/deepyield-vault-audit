@@ -1,0 +1,23 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.24"
+optimizer = true
+optimizer_runs = 200
+# via_ir: REQUIRED by the Vault B two-sided open path. The open carries 7 inputs
+# (2 amounts + 2 ticks + 2 mins + deadline); both DedicatedVaultMain.openPosition and
+# PancakeV3MasterchefVenue.open exceed the legacy (non-IR) codegen stack limit
+# ("dataEnd ... too deep") — confirmed by isolating each, and true whether the inputs
+# are passed as 7 params or grouped into a 7-field struct. The IR pipeline is the
+# compiler's own recommended fix. Explicit, repo-wide; full-suite regression verified
+# (see vault-inbox report on the rewire). Without it `FOUNDRY_VIA_IR=false forge build`
+# fails by design.
+via_ir = true
+fs_permissions = [{ access = "read-write", path = "./" }]
+
+[rpc_endpoints]
+bsc = "https://bsc-dataseed1.binance.org"
+bsc_backup = "https://bsc-dataseed2.binance.org"
+hyperevm_testnet = "https://rpc.hyperliquid-testnet.xyz/evm"

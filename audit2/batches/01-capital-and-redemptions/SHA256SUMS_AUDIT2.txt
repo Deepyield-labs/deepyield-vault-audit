@@ -1,0 +1,3 @@
+a3d3daf13f795dcd5a7b74fde85ef1be0eb3a554cef72549351d790c79e05dda  flat/DedicatedVaultStrategyAdapterV2.audit2.flat.sol
+536f7a5bafdc9ac89c1f04695a29ba5b177dea482f8e7aca1ff755f0e414b136  flat/DeepYieldVaultB.audit2.flat.sol
+f8cb305a48518322d7bc0825728f10351a734a21ab3422d4546d2af778889083  flat/FixedFeeSink.audit2.flat.sol
