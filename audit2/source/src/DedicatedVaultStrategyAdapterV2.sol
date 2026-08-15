@@ -41,11 +41,11 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
 
     uint256 public accountedAssets;
     uint256 public panicNonce;
-    /// @notice Fee assets pulled from Main but not yet accepted by the fee sink
-    /// (the sink reverted). Held in this adapter as an obligation owed to
-    /// `feeRecipient` and remitted later via `remitFee()`. Excluded from vault
-    /// NAV: it lives in this adapter's own balance, which `estimatedTotalAssets`
-    /// (Main assets only) does not count.
+    /// @notice Fee assets pulled from Main but not accepted in full by the fee
+    /// sink (it reverted or under-pulled). Held in this adapter as an
+    /// obligation owed to `feeRecipient` and remitted later via `remitFee()`.
+    /// Excluded from vault NAV: it lives in this adapter's own balance, which
+    /// `estimatedTotalAssets` (Main assets only) does not count.
     uint256 public unremittedFee;
 
     error NotVault();
@@ -131,7 +131,7 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
     /// @notice Canonical Main callback used immediately before an automatic
     /// withdrawal-cycle commit. It makes the Vault snapshot authoritative before
     /// Main starts an irreversible close step.
-    function prepareWithdrawalCycleCommit() external {
+    function prepareWithdrawalCycleCommit() external nonReentrant {
         if (msg.sender != address(main)) revert NotMain();
         IVaultBRedeemCycleCommit(vault).prepareRedeemCycleCommit();
     }
@@ -241,7 +241,7 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
             withdrawn = _pullIdle(idle);
             asset.safeTransfer(vault, withdrawn);
         }
-        accountedAssets = 0;
+        accountedAssets = asset.balanceOf(address(main));
     }
 
     function harvest() external onlyRole(MANAGER_ROLE) nonReentrant returns (uint256 profit, uint256 feeAssets) {
@@ -257,6 +257,15 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         main.halt();
         uint256 positionId = main.activePositionId();
         if (positionId != 0) {
+            // Main normally snapshots the Vault through this Adapter immediately
+            // before an automatic close-side commit. During panic this Adapter
+            // already holds the reentrancy lock, so pre-snapshot and commit the
+            // queue here before Main starts its one-way LP close. Main then sees
+            // an already committed cycle and cannot callback into this lock.
+            if (main.queuedWithdrawalCount() != 0 && !main.withdrawalCycleCommitted()) {
+                IVaultBRedeemCycleCommit(vault).prepareRedeemCycleCommit();
+                main.commitWithdrawalCycle();
+            }
             bytes32 jobId = keccak256(abi.encode("ADAPTER_PANIC", address(this), ++panicNonce, positionId));
             main.closeToInventory(jobId, block.timestamp + 60, true);
             main.halt();
@@ -321,7 +330,12 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         try feeSink.recordFee(amount) {
             asset.forceApprove(feeRecipient, 0);
             uint256 paid = beforeBalance - asset.balanceOf(address(this));
-            if (paid != amount) revert FeeSinkPullMismatch(amount, paid);
+            if (paid > amount) revert FeeSinkPullMismatch(amount, paid);
+            uint256 unpaid = amount - paid;
+            if (unpaid != 0) {
+                unremittedFee += unpaid;
+                emit FeeRemittanceDeferred(unpaid, unremittedFee);
+            }
         } catch {
             // Sink unavailable (paused, blacklist, treasury-mode, or a bug):
             // do NOT revert the user's withdrawal. Keep the fee assets in this

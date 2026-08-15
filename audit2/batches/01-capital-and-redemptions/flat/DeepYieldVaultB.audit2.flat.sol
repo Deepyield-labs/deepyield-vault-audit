@@ -5552,7 +5552,7 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     }
 
     function availableImmediateLiquidity() public view returns (uint256) {
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 idle = _spendableIdle();
         if (address(strategy) == address(0)) return idle;
         // P1-T1: the strategy is external; a revert here must not brick the four
         // ERC-4626 max* views. On failure, degrade to the immediately-idle balance
@@ -5892,7 +5892,7 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         } else {
             assets = previewRedeem(shares);
         }
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 idle = _spendableIdle();
         uint256 missing = assets > idle ? assets - idle : 0;
 
         request.status = RedeemStatus.CLAIMED;
@@ -5909,8 +5909,9 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
             uint256 withdrawn = activeStrategy.claimWithdrawal(request.strategyRequestId, missing);
             if (withdrawn < missing) revert StrategyShortfall(missing, withdrawn);
         }
-        if (IERC20(asset()).balanceOf(address(this)) < assets) {
-            revert StrategyShortfall(assets, IERC20(asset()).balanceOf(address(this)));
+        uint256 spendableIdle = _spendableIdle();
+        if (spendableIdle < assets) {
+            revert StrategyShortfall(assets, spendableIdle);
         }
 
         _burn(address(this), shares);
@@ -6050,13 +6051,19 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     }
 
     function _ensureLiquidity(uint256 assetsNeeded) internal {
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 idle = _spendableIdle();
         if (idle >= assetsNeeded) return;
         IVaultBAsyncStrategy activeStrategy = strategy;
         if (address(activeStrategy) == address(0)) revert StrategyUnset();
         uint256 missing = assetsNeeded - idle;
         uint256 withdrawn = activeStrategy.withdrawToVault(missing);
         if (withdrawn < missing) revert StrategyShortfall(missing, withdrawn);
+    }
+
+    function _spendableIdle() internal view returns (uint256) {
+        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 reserved = totalClaimableAssets;
+        return idle > reserved ? idle - reserved : 0;
     }
 
     function _initializeRedeemCycleSettlement(IVaultBAsyncStrategy activeStrategy) internal {

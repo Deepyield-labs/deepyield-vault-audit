@@ -1,12 +1,15 @@
-# Audit 2 — Batch 04: pricing and swap execution
+# Audit 2 — Batch 04 upload queue
 
-Upload the four files in `flat/` individually.
+This directory contains **four separate paid tasks**, not one combined audit.
+Upload one flat per request; do not add another task's contract as a required
+review target.
 
-Review both PriceGuards and bounded execution adapters for oracle/TWAP source
-integrity, emergency loss/deviation policy, capacity accounting, quote-to-swap
-binding, deadlines, pool/feed provenance, token decimals and deployment
-parameters.
+| Task | File | Scope and residual handoff |
+|---:|---|---|
+| 6 | `VaultBPriceGuard.audit2.flat.sol` | WBNB oracle/TWAP integrity, deviations, normal/emergency loss budgets, caps, and configuration. See `../../EXTERNAL_REVIEW_INPUTS_AUDIT2.md`. Executor/Main policy is out of scope. |
+| 7 | `BoundedPancakeExecutionAdapterV2.audit2.flat.sol` | WBNB swap binding, approvals/input accounting, minimums/deadlines, and observed output/router mismatch handling. Guard/Main policy is out of scope. |
+| 8 | `VaultBCakePriceGuard.audit2.flat.sol` | CAKE source integrity, decimal handling, divergence, active-window consumed-notional retention, emergency budgets, caps, and configuration. Reward adapter/Main policy is out of scope. |
+| 9 | `BoundedPancakeRewardAdapterV2.audit2.flat.sol` | CAKE swap binding, approvals/input accounting, minimums/deadlines, observed output/router mismatch handling, and emergency-budget consumption only after settlement/output checks. Guard/Main policy is out of scope. |
 
-Explicitly re-evaluate the historical PriceGuard review hypotheses in
-`../../EXTERNAL_REVIEW_INPUTS_AUDIT2.md`. Then assess all guards/adapters
-together with Main in Batch 02; isolated policy checks are insufficient.
+A Main/guards/adapters integration review, if wanted after these four
+independent reviews, must be separately funded and scoped.

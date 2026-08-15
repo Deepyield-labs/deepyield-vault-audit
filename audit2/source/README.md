@@ -1,10 +1,12 @@
 # Raw source snapshot
 
-This directory is a minimal first-party source closure for the Round 9 deploy
-graph. It excludes dead/legacy products by design; see `../SCOPE.md`.
+This directory is the minimal 32-file first-party source closure for the Vault
+B V2 deployment graph. The exact source identity is contract-repository commit
+`18c1beb5071605385ecc0276322d87e6c6ea5652`. The files under `../flat/` were
+generated independently from that same commit with solc `0.8.24`, optimizer
+runs `200`, via-IR, Cancun, and IPFS metadata.
 
-The exact source identity is commit
-`65b8af752beb2a86c000363bba255a4e1ef66297` of the contract repository. The
-files under `flat/` are generated from that same commit and include vendored
-dependency context for self-contained review. `SHA256SUMS.txt` covers every raw
-file in this directory except itself.
+`SHA256SUMS.txt` covers every raw file here except itself. The snapshot omits
+legacy, partner, HyperEVM, and other unreachable code. It also intentionally
+omits `VaultFeesLib.sol`, which is not part of this deployment closure; see
+`../SCOPE_AUDIT2.md`.

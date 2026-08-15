@@ -146,13 +146,20 @@ contract VaultBCakePriceGuard is AccessControlDefaultAdminRules, IVaultBRewardPr
                 || expiresAt > block.timestamp + maxEmergencyDuration || notionalLimit == 0
                 || notionalLimit > maxEmergencyNotional
         ) revert InvalidEmergencyBudget();
+        bool active =
+            emergencyLossBps != 0 && emergencyLossBps <= maxEmergencyLossBps && emergencyExpiresAt > block.timestamp;
+        uint256 consumed = active ? emergencyNotionalConsumed : 0;
+        if (notionalLimit < consumed) revert InvalidEmergencyBudget();
         emergencyLossBps = lossBps;
         emergencyExpiresAt = expiresAt;
         emergencyNotionalLimit = notionalLimit;
-        emergencyNotionalConsumed = 0;
+        emergencyNotionalConsumed = consumed;
         emit EmergencyBudgetActivated(lossBps, expiresAt, notionalLimit);
     }
 
+    /// @notice Explicitly terminates the current incident and resets its budget.
+    /// A guardian that intends to retain consumed notional must reactivate while
+    /// the window is still active instead of clearing it first.
     function clearEmergencyBudget() external onlyRole(GUARDIAN_ROLE) {
         emergencyLossBps = 0;
         emergencyExpiresAt = 0;
@@ -263,7 +270,8 @@ contract VaultBCakePriceGuard is AccessControlDefaultAdminRules, IVaultBRewardPr
         uint256 unsigned = uint256(answer);
         if (decimals == 18) return unsigned;
         if (decimals < 18) return unsigned * (10 ** (18 - decimals));
-        return unsigned / (10 ** (decimals - 18));
+        answerWad = unsigned / (10 ** (decimals - 18));
+        if (answerWad == 0) revert InvalidOracleAnswer(address(feed));
     }
 
     /// @notice Reject a Chainlink answer pinned to its aggregator's min/maxAnswer

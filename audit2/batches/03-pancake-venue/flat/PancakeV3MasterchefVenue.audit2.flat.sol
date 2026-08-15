@@ -1814,6 +1814,7 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
     /// (Proven by the wired fork test; mocks couldn't catch the ownership gate.)
     function harvest(uint256 positionId) external onlyController returns (uint256 assetCollected) {
         if (positionId == 0 || positionId != activeTokenId) revert NoActivePosition();
+        _requireStage(CloseStage.NONE);
         uint8 failedMask;
         bool assetHeldAtVenue;
         if (activeStaked) {

@@ -367,6 +367,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
                 || venue.poolAddress() != VAULT_B_POOL
         ) revert InvalidVenueIdentity();
         if (activePositionId != 0) revert PositionActive();
+        if (activeOpenJobId != bytes32(0)) revert OpenSeriesActive(activeOpenJobId);
         // Liveness is determined by inventory Main observed through canonical
         // protocol calls, never by a permissionless ERC-20 donation.
         if (accountedPairedInventory > PAIRED_DUST_TOLERANCE) {
@@ -584,6 +585,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         bytes32 active = activeOpenJobId;
         if (active == bytes32(0)) revert NoActiveOpenSeries();
         if (active != jobId) revert OpenSeriesActive(active);
+        if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
         // The swap leg is bounded by the RESERVED position budget (itself <= canaryOpenCap),
         // enforced inside MainV2Open AFTER chunk-sequencing so a duplicate/sparse chunk
         // still reports its own error rather than the budget bound.
@@ -593,6 +595,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
             usedChunks,
             dailySwapNotional,
             executionAdapter,
+            priceGuard,
             asset,
             SwapChunkCall(
                 jobId,
@@ -678,7 +681,12 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (accountedPairedInventory > PAIRED_DUST_TOLERANCE) revert InventoryPresent(accountedPairedInventory);
         activeOpenJobId = bytes32(0);
         delete openSeriesContext; // B11-T1: a cancelled series leaves no budget to inherit
-        MainV2Jobs.completeJob(jobs[jobId]);
+        Job storage job = jobs[jobId];
+        // A reservation precedes the first chunk, so a cancelled never-started
+        // series has no job record yet. Preserve its OPEN identity before marking
+        // the terminal status, which prevents a later jobId reuse under a NONE kind.
+        if (job.status == JobStatus.NONE) job.kind = JobKind.OPEN;
+        MainV2Jobs.completeJob(job);
         emit OpenSeriesCancelled(jobId);
     }
 
@@ -741,6 +749,10 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         uint256 positionId = activePositionId;
         if (positionId == 0) revert NoActivePosition();
         _commitWithdrawalCycleIfQueued();
+        // Unstaking leaves the LP manually staged for the guardian. Freeze an
+        // operating vault at the same queue-commit boundary, but never weaken
+        // a pre-existing HALT.
+        if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
         (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.forceUnstakeAndCredit(
             venue, pairedToken, rewardToken, positionId, accountedPairedInventory, accountedRewardInventory
         );
@@ -789,6 +801,10 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         uint256 positionId = activePositionId;
         if (positionId == 0) revert NoActivePosition();
         if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
+        // A request can arrive after an empty-queue unstake and before this
+        // realization step. Commit its Vault snapshot before any Venue preview
+        // or decrease so it cannot be cancelled after manual close advances.
+        _commitWithdrawalCycleIfQueued();
         (uint256 amount0Min, uint256 amount1Min) = MainV2Inventory.recoveryDecreaseMinimums(
             venue,
             priceGuard,
@@ -819,6 +835,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     function recoverCloseCollect() external onlyRole(GUARDIAN_ROLE) nonReentrant {
         uint256 positionId = activePositionId;
         if (positionId == 0) revert NoActivePosition();
+        _commitWithdrawalCycleIfQueued();
         if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
         (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.closeCollectAndCredit(
             address(venue), pairedToken, rewardToken, positionId, accountedPairedInventory, accountedRewardInventory
@@ -832,6 +849,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     function recoverCloseBurn() external onlyRole(GUARDIAN_ROLE) nonReentrant {
         uint256 positionId = activePositionId;
         if (positionId == 0) revert NoActivePosition();
+        _commitWithdrawalCycleIfQueued();
         if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
         (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.closeBurnAndCredit(
             address(venue), pairedToken, rewardToken, positionId, accountedPairedInventory, accountedRewardInventory
@@ -891,6 +909,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
         else _checkRole(KEEPER_ROLE, msg.sender);
         if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
         // Body in the linked MainV2Liquidation (EIP-170); it runs via delegatecall,
         // so token balances/approvals and the mapping pointers act on this
         // contract. Main keeps the role/halt gate and the loss journal + event.
@@ -937,6 +956,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
         else _checkRole(KEEPER_ROLE, msg.sender);
         if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
         // Body in the linked MainV2Liquidation (EIP-170), same delegatecall
         // arrangement as liquidateAllWbnb.
         uint256 amountIn;

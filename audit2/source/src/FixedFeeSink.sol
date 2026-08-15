@@ -42,7 +42,7 @@ contract FixedFeeSink is AccessControlDefaultAdminRules, ReentrancyGuard, IFeeSi
         AccessControlDefaultAdminRules(DEFAULT_ADMIN_TRANSFER_DELAY, admin_)
     {
         if (address(asset_) == address(0) || admin_ == address(0)) revert ZeroAddress();
-        if (projectTreasury_ == address(0) || projectTreasury_ == address(this)) revert InvalidTreasury();
+        if (projectTreasury_ == address(0) || projectTreasury_ == address(this) || projectTreasury_ == address(asset_)) revert InvalidTreasury();
         asset = asset_;
         projectTreasury = projectTreasury_;
     }
@@ -67,7 +67,9 @@ contract FixedFeeSink is AccessControlDefaultAdminRules, ReentrancyGuard, IFeeSi
     }
 
     function proposeProjectTreasury(address newTreasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newTreasury == address(0) || newTreasury == address(this)) revert InvalidTreasury();
+        if (newTreasury == address(0) || newTreasury == address(this) || newTreasury == address(asset)) {
+            revert InvalidTreasury();
+        }
         pendingProjectTreasury = newTreasury;
         pendingProjectTreasuryReadyAt = uint64(block.timestamp + TREASURY_CHANGE_DELAY);
         emit ProjectTreasuryProposed(newTreasury, pendingProjectTreasuryReadyAt);
@@ -100,7 +102,15 @@ contract FixedFeeSink is AccessControlDefaultAdminRules, ReentrancyGuard, IFeeSi
         recovered = asset.balanceOf(address(this));
         if (recovered == 0) return 0;
         address treasury = projectTreasury;
+        uint256 treasuryBefore = asset.balanceOf(treasury);
         asset.safeTransfer(treasury, recovered);
+        uint256 sinkAfter = asset.balanceOf(address(this));
+        uint256 treasuryAfter = asset.balanceOf(treasury);
+        uint256 sinkDelta = recovered >= sinkAfter ? recovered - sinkAfter : 0;
+        uint256 treasuryDelta = treasuryAfter >= treasuryBefore ? treasuryAfter - treasuryBefore : 0;
+        if (sinkDelta != recovered || treasuryDelta != recovered) {
+            revert TransferMismatch(recovered, sinkDelta, treasuryDelta);
+        }
         emit UnrecordedRecovered(treasury, recovered);
     }
 }

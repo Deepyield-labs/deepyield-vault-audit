@@ -604,6 +604,7 @@ contract BoundedPancakeRewardAdapterV2 is IVaultBRewardExecutionAdapterV2 {
     error InputNotFullySpent(uint256 residual);
     error UnexpectedOutputBalance(uint256 beforeBalance, uint256 afterBalance);
     error RouterOutputMismatch(uint256 reported, uint256 observed);
+    error MinOutNotMet(uint256 required, uint256 actual);
 
     event RewardSwapExecuted(
         uint256 amountIn,
@@ -633,7 +634,7 @@ contract BoundedPancakeRewardAdapterV2 is IVaultBRewardExecutionAdapterV2 {
         // cheaper and safer to redeploy than to add runtime Main rotation.
         if (msg.sender != binder) revert NotBinder();
         if (main != address(0)) revert AlreadyBound();
-        if (main_ == address(0) || main_.code.length == 0) revert InvalidMain();
+        if (main_ == address(0) || main_ == address(this) || main_.code.length == 0) revert InvalidMain();
         main = main_;
         emit MainBound(main_);
     }
@@ -676,15 +677,24 @@ contract BoundedPancakeRewardAdapterV2 is IVaultBRewardExecutionAdapterV2 {
         // Exact equality is intentional for canonical BSC CAKE/USDT. Neither
         // token rebases or charges transfer fees in this deployment.
         uint256 adapterInputAfter = input.balanceOf(address(this));
-        if (adapterInputAfter != adapterInputBefore) revert InputNotFullySpent(adapterInputAfter - adapterInputBefore);
+        if (adapterInputAfter != adapterInputBefore) {
+            uint256 residual = adapterInputAfter > adapterInputBefore
+                ? adapterInputAfter - adapterInputBefore
+                : adapterInputBefore - adapterInputAfter;
+            revert InputNotFullySpent(residual);
+        }
         uint256 adapterOutputAfter = output.balanceOf(address(this));
         if (adapterOutputAfter != adapterOutputBefore) {
             revert UnexpectedOutputBalance(adapterOutputBefore, adapterOutputAfter);
         }
 
-        amountOut = output.balanceOf(main) - mainOutputBefore;
+        uint256 mainOutputAfter = output.balanceOf(main);
+        if (mainOutputAfter < mainOutputBefore) {
+            revert UnexpectedOutputBalance(mainOutputBefore, mainOutputAfter);
+        }
+        amountOut = mainOutputAfter - mainOutputBefore;
         if (amountOut != reportedOut) revert RouterOutputMismatch(reportedOut, amountOut);
-        if (amountOut < effectiveMinOut) revert RouterOutputMismatch(effectiveMinOut, amountOut);
+        if (amountOut < effectiveMinOut) revert MinOutNotMet(effectiveMinOut, amountOut);
 
         if (emergencyBudgetUsed) priceGuard.consumeEmergencyNotional(emergencyNotional);
 

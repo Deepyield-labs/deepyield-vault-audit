@@ -143,13 +143,20 @@ contract VaultBPriceGuard is AccessControlDefaultAdminRules, IVaultBPriceGuard {
             lossBps < normalLossBps || lossBps > maxEmergencyLossBps || expiresAt <= block.timestamp
                 || expiresAt > block.timestamp + maxEmergencyDuration || notionalLimit == 0
         ) revert InvalidEmergencyBudget();
+        bool active =
+            emergencyLossBps != 0 && emergencyLossBps <= maxEmergencyLossBps && emergencyExpiresAt > block.timestamp;
+        uint256 consumed = active ? emergencyNotionalConsumed : 0;
+        if (notionalLimit < consumed) revert InvalidEmergencyBudget();
         emergencyLossBps = lossBps;
         emergencyExpiresAt = expiresAt;
         emergencyNotionalLimit = notionalLimit;
-        emergencyNotionalConsumed = 0;
+        emergencyNotionalConsumed = consumed;
         emit EmergencyBudgetActivated(lossBps, expiresAt, notionalLimit);
     }
 
+    /// @notice Explicitly terminates the current incident and resets its budget.
+    /// A guardian that intends to retain consumed notional must reactivate while
+    /// the window is still active instead of clearing it first.
     function clearEmergencyBudget() external onlyRole(GUARDIAN_ROLE) {
         emergencyLossBps = 0;
         emergencyExpiresAt = 0;

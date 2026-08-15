@@ -1,60 +1,77 @@
-# Vault B V2 — Audit 2, Round 9 candidate
+# Vault B V2 — Audit 2 re-audit package
 
-This is a separate pre-deployment audit package. It is intentionally isolated
-from the historical scope in the repository root and is not a deployment
-approval or a claim that historical findings are remediated.
+This is a separate pre-deployment re-audit package. It supersedes this
+repository's older Audit 2 package only on branch
+`audit2/reaudit-18c1beb-20260815`; it does not alter historical branches,
+approve deployment, or assert that any finding is remediated.
 
 | Field | Value |
 |---|---|
-| Candidate source commit | `65b8af752beb2a86c000363bba255a4e1ef66297` |
-| Compiler | solc `0.8.24`, optimizer runs `200`, via-IR |
+| Candidate source commit | `18c1beb5071605385ecc0276322d87e6c6ea5652` |
+| Compiler | solc `0.8.24`, optimizer runs `200`, via-IR, Cancun, IPFS metadata |
+| Flattener | Forge `1.6.0-v1.7.0`, commit `f83bad912a9dba7bf0371def1e70bb1896048356` |
 | Chain target | BNB Smart Chain, chain ID `56` |
-| Status | Pre-audit; not deployed |
+| Status | Pre-deployment re-audit; not deployed |
 
 ## Contents
 
-- `source/` — first-party deploy-graph source closure and deployment script.
-  Solidity source filenames remain canonical so imports and source checksums
-  remain reproducible.
-- `flat/` — nine self-contained flats, each named
+- `source/` — the 32-file first-party source closure and deployment script.
+- `flat/` — nine self-contained upload units named
   `<Contract>.audit2.flat.sol`.
-- `batches/` — four auditor upload queues; see
-  [BATCHES_AUDIT2.md](BATCHES_AUDIT2.md).
-- [SCOPE_AUDIT2.md](SCOPE_AUDIT2.md) — exact in-scope graph and exclusions.
+- `batches/` — upload locations only. Each flat is a separate paid review
+  task; see [BATCHES_AUDIT2.md](BATCHES_AUDIT2.md).
+- [SCOPE_AUDIT2.md](SCOPE_AUDIT2.md) — deploy graph and exclusions.
 - [EXTERNAL_REVIEW_INPUTS_AUDIT2.md](EXTERNAL_REVIEW_INPUTS_AUDIT2.md) —
-  historical PriceGuard report and required re-evaluation topics.
+  historical PriceGuard input and review hypotheses.
 
-Verify the raw source and flats before review:
+Verify the package before review:
 
 ```sh
 (cd source && shasum -a 256 -c SHA256SUMS.txt)
 (cd flat && shasum -a 256 -c SHA256SUMS_AUDIT2.txt)
 (cd batches/01-capital-and-redemptions && shasum -a 256 -c SHA256SUMS_AUDIT2.txt)
+(cd batches/02-main-lifecycle && shasum -a 256 -c SHA256SUMS_AUDIT2.txt)
+(cd batches/03-pancake-venue && shasum -a 256 -c SHA256SUMS_AUDIT2.txt)
+(cd batches/04-pricing-and-swap-execution && shasum -a 256 -c SHA256SUMS_AUDIT2.txt)
+(shasum -a 256 -c PACKAGE_SHA256SUMS_AUDIT2.txt)
 ```
 
-The same check applies to each remaining batch. A flat is one upload unit;
-do not concatenate flats because imported context repeats between them.
+The batch copy of each flat is byte-identical to its `flat/` counterpart. Do
+not concatenate flats: imported context repeats between upload units.
 
-## QA and size record
+Each master flat was generated twice from a frozen full-repository export of
+the candidate, with the tracked dependencies present, and the two outputs were
+compared byte-for-byte. The generation primitive was:
 
-Targeted non-fork checks at the candidate commit:
+```sh
+forge flatten "src/<Contract>.sol" -o "audit2/flat/<Contract>.audit2.flat.sol"
+```
 
-| Check | Result |
-|---|---:|
-| Deploy dry-run | 4 PASS / 0 FAIL |
-| Main H-1/H-3 red witnesses | 4 PASS / 0 FAIL |
-| Venue red witnesses | 10 PASS / 0 FAIL |
-| Venue adversarial suite | 41 PASS / 0 FAIL |
+## Independent acceptance and byte sizes
 
-The suite was not run as one monolithic command. Archive-dependent fork
-coverage is not represented as a pass.
+Independent acceptance of the exact candidate ran 429 focused non-fork tests:
+429 PASS, 0 FAIL, 0 SKIP. It also checked the integration lineage, storage/API
+surface, and targeted formatting. Fork-gated and monolithic test runs are not
+represented as a pass here.
 
-`DeepYieldVaultB` runtime is 22,576 bytes, leaving 2,000 bytes to EIP-170.
-Any further Vault change requires a size review before implementation.
+| Contract | Runtime bytes | EIP-170 margin |
+|---|---:|---:|
+| `DeepYieldVaultB` | 22,147 | 2,429 |
+| `DedicatedVaultMainV2` | 21,644 | 2,932 |
+| `DedicatedVaultStrategyAdapterV2` | 12,429 | 12,147 |
+| `PancakeV3MasterchefVenue` | 19,612 | 4,964 |
+| `VaultBPriceGuard` | 12,983 | 11,593 |
+| `VaultBCakePriceGuard` | 11,975 | 12,601 |
+| `BoundedPancakeExecutionAdapterV2` | 6,155 | 18,421 |
+| `BoundedPancakeRewardAdapterV2` | 3,594 | 20,982 |
+| `FixedFeeSink` | 5,882 | 18,694 |
+
+All byte counts are deployed runtime bytecode after stripping a leading `0x`.
 
 ## Review request
 
-Report vulnerabilities, economic/accounting defects, authorization failures,
-denial-of-service and withdrawal-liveness risks, and configuration risks. For
-each issue provide raw-source and flat locations, preconditions, exploit or
-failure scenario, severity rationale, and a minimal remediation.
+For each finding, provide flat and raw-source locations, preconditions, an
+exploit or failure scenario, severity rationale, and minimal remediation.
+Follow the one-file paid-task boundaries in `BATCHES_AUDIT2.md`. A later
+cross-contract integration assessment, if desired, must be a separately
+scoped and funded task.

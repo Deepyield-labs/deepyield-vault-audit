@@ -1,29 +1,30 @@
-# Audit 2 — auditor upload plan
+# Audit 2 — one-file paid review plan
 
-Each `.audit2.flat.sol` file is uploaded as an individual Solidity unit.
-The batch directories are review queues, not files to concatenate.
+Every `.audit2.flat.sol` file below is one paid external task. A batch is an
+upload location only, not a combined scope. Each task must state: **Audit ONLY
+the linked flat file. Do not treat another paid task's contract as in-scope.**
 
-| Order | Batch | Flat contracts |
-|---:|---|---|
-| 1 | [capital and redemptions](batches/01-capital-and-redemptions/README_AUDIT2.md) | DeepYieldVaultB, FixedFeeSink, DedicatedVaultStrategyAdapterV2 |
-| 2 | [Main lifecycle](batches/02-main-lifecycle/README_AUDIT2.md) | DedicatedVaultMainV2 |
-| 3 | [Pancake Venue](batches/03-pancake-venue/README_AUDIT2.md) | PancakeV3MasterchefVenue |
-| 4 | [pricing and swap execution](batches/04-pricing-and-swap-execution/README_AUDIT2.md) | VaultBPriceGuard, BoundedPancakeExecutionAdapterV2, VaultBCakePriceGuard, BoundedPancakeRewardAdapterV2 |
+| Paid-task order | Upload location | Flat file | Narrow review boundary |
+|---:|---|---|---|
+| 1 | Batch 01 | `DeepYieldVaultB` | ERC-4626 accounting; async queue, cancellation, claims, claimable-reserve isolation, liabilities, and Strategy-boundary assumptions |
+| 2 | Batch 01 | `FixedFeeSink` | forwarding, treasury timelock, balance deltas, and recipient failures |
+| 3 | Batch 01 | `DedicatedVaultStrategyAdapterV2` | Vault/Main bridge, fee basis, deferred or under-pulled fee remittance, callbacks, ordering, and transfer deltas |
+| 4 | Batch 02 | `DedicatedVaultMainV2` | Main lifecycle, recovery, inventory, liquidation, withdrawal readiness, and its linked first-party libraries |
+| 5 | Batch 03 | `PancakeV3MasterchefVenue` | NFT/MasterChef lifecycle, staged close/harvest, rescue, rotation, and write-off boundaries |
+| 6 | Batch 04 | `VaultBPriceGuard` | WBNB oracle/TWAP policy, deviations, loss budgets, and caps |
+| 7 | Batch 04 | `BoundedPancakeExecutionAdapterV2` | WBNB execution binding, approvals, minimums/deadlines, and observed output |
+| 8 | Batch 04 | `VaultBCakePriceGuard` | CAKE source/decimal/divergence, active-window consumed-notional retention, and emergency budget policy |
+| 9 | Batch 04 | `BoundedPancakeRewardAdapterV2` | CAKE execution binding, approvals, minimums/deadlines, observed output, and post-settlement emergency-budget debit ordering |
 
-## Mandatory cross-batch pass
+Scope is the named deployable plus first-party library logic linked, inlined,
+or transitively compiled into its runtime. Another deployable, and dependency
+code pulled in solely through it, is context and out of scope when it appears
+only for type resolution. In particular, the Strategy flat contains Main and
+`MainV2*` implementation context because it imports the concrete Main type;
+that context belongs exclusively to task 4. The Main task owns its linked
+first-party libraries, but does not require review of the separate Venue,
+guard, adapter, Vault, or Strategy implementation.
 
-After individual review, assess:
-
-1. `DeepYieldVaultB -> DedicatedVaultStrategyAdapterV2 -> DedicatedVaultMainV2`
-   for asset/share conversion, queue commitments, losses, and fees.
-2. `DedicatedVaultMainV2 -> PancakeV3MasterchefVenue` for state transitions,
-   observed balances, recovery, write-off, and HALTED-mode invariants.
-3. `DedicatedVaultMainV2 -> PriceGuards -> Swap Adapters` for quote-to-swap
-   binding, normal/emergency loss policy, capacity, inventory, and liquidation
-   liveness.
-4. Immutable deployment wiring in
-   `source/script/DeployVaultBV2.s.sol`.
-
-The historical PriceGuard re-audit listed in
-[EXTERNAL_REVIEW_INPUTS_AUDIT2.md](EXTERNAL_REVIEW_INPUTS_AUDIT2.md) targeted
-an older commit and must be re-evaluated, not presumed fixed.
+If a cross-contract assessment is required after the nine reviews, commission
+it as a separate tenth task with its own funded scope and links. Do not impose
+that assessment as a condition of any individual task.

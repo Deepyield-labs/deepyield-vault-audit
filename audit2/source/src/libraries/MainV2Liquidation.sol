@@ -44,7 +44,9 @@ library MainV2Liquidation {
 
     error InvalidAmount();
     error SwapCapExceeded(uint256 requested, uint256 cap);
+    error DailySwapCapExceeded(uint256 requested, uint256 cap);
     error SwapBelowFloor(uint256 floor, uint256 amountOut);
+    error InventoryDeltaMismatch(uint256 reported, uint256 observed);
     error InventoryRemaining(uint256 pairedBalance);
     error RewardInventoryRemaining(uint256 rewardBalance);
 
@@ -67,13 +69,23 @@ library MainV2Liquidation {
         uint256 headroom = used >= jobCap ? 0 : jobCap - used;
         notional = priceGuard.fairValue(WBNB, USDT, balance);
         amountIn = balance;
-        // Slice down to per-job headroom only on a non-final chunk. A final chunk
-        // whose notional exceeds the cap still reverts SwapCapExceeded in
+        uint256 sliceHeadroom = headroom;
+        uint256 dailyUsed;
+        if (!p.emergency) {
+            dailyUsed = dailySwapNotional[uint64(block.timestamp / 1 days)];
+            uint256 dailyHeadroom = dailyUsed >= p.dailySwapLimit ? 0 : p.dailySwapLimit - dailyUsed;
+            if (dailyHeadroom < sliceHeadroom) sliceHeadroom = dailyHeadroom;
+        }
+        // Slice down to the lesser job/daily headroom only on a non-final chunk. A final chunk
+        // whose notional exceeds a job or daily cap still reverts in
         // reserveSwapNotional (single-call cap semantics unchanged); an oversized
         // residual is drained by issuing non-final chunks first.
-        if (notional > headroom && !p.finalChunk) {
+        if (notional > sliceHeadroom && !p.finalChunk) {
             if (headroom == 0) revert SwapCapExceeded(notional, jobCap);
-            amountIn = FullMath.mulDiv(balance, headroom, notional);
+            if (!p.emergency && sliceHeadroom == 0) {
+                revert DailySwapCapExceeded(dailyUsed + notional, p.dailySwapLimit);
+            }
+            amountIn = FullMath.mulDiv(balance, sliceHeadroom, notional);
             if (amountIn == 0) revert SwapCapExceeded(notional, jobCap);
             notional = priceGuard.fairValue(WBNB, USDT, amountIn);
         }
@@ -86,9 +98,14 @@ library MainV2Liquidation {
         // observe an exhausted budget and incorrectly replace the emergency
         // floor with the normal floor.
         uint256 floor = priceGuard.minimumOut(WBNB, USDT, amountIn, p.emergency);
+        uint256 assetBefore = IERC20(USDT).balanceOf(address(this));
         pairedToken.forceApprove(address(executionAdapter), amountIn);
-        amountOut = executionAdapter.swapPairedToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
+        uint256 reportedOut = executionAdapter.swapPairedToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
         pairedToken.forceApprove(address(executionAdapter), 0);
+        uint256 assetAfter = IERC20(USDT).balanceOf(address(this));
+        if (assetAfter < assetBefore) revert InventoryDeltaMismatch(reportedOut, 0);
+        amountOut = assetAfter - assetBefore;
+        if (reportedOut != amountOut) revert InventoryDeltaMismatch(reportedOut, amountOut);
         if (amountOut < floor) revert SwapBelowFloor(floor, amountOut);
 
         if (p.finalChunk) {
@@ -120,9 +137,19 @@ library MainV2Liquidation {
         uint256 headroom = used >= jobCap ? 0 : jobCap - used;
         notional = rewardPriceGuard.fairValue(balance);
         amountIn = balance;
-        if (notional > headroom && !p.finalChunk) {
+        uint256 sliceHeadroom = headroom;
+        uint256 dailyUsed;
+        if (!p.emergency) {
+            dailyUsed = dailySwapNotional[uint64(block.timestamp / 1 days)];
+            uint256 dailyHeadroom = dailyUsed >= p.dailySwapLimit ? 0 : p.dailySwapLimit - dailyUsed;
+            if (dailyHeadroom < sliceHeadroom) sliceHeadroom = dailyHeadroom;
+        }
+        if (notional > sliceHeadroom && !p.finalChunk) {
             if (headroom == 0) revert SwapCapExceeded(notional, jobCap);
-            amountIn = FullMath.mulDiv(balance, headroom, notional);
+            if (!p.emergency && sliceHeadroom == 0) {
+                revert DailySwapCapExceeded(dailyUsed + notional, p.dailySwapLimit);
+            }
+            amountIn = FullMath.mulDiv(balance, sliceHeadroom, notional);
             if (amountIn == 0) revert SwapCapExceeded(notional, jobCap);
             notional = rewardPriceGuard.fairValue(amountIn);
         }
@@ -131,9 +158,15 @@ library MainV2Liquidation {
         );
 
         uint256 floor = rewardPriceGuard.minimumOut(amountIn, p.emergency);
+        uint256 assetBefore = IERC20(USDT).balanceOf(address(this));
         rewardToken.forceApprove(address(rewardExecutionAdapter), amountIn);
-        amountOut = rewardExecutionAdapter.swapRewardToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
+        uint256 reportedOut =
+            rewardExecutionAdapter.swapRewardToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
         rewardToken.forceApprove(address(rewardExecutionAdapter), 0);
+        uint256 assetAfter = IERC20(USDT).balanceOf(address(this));
+        if (assetAfter < assetBefore) revert InventoryDeltaMismatch(reportedOut, 0);
+        amountOut = assetAfter - assetBefore;
+        if (reportedOut != amountOut) revert InventoryDeltaMismatch(reportedOut, amountOut);
         if (amountOut < floor) revert SwapBelowFloor(floor, amountOut);
 
         if (p.finalChunk) {

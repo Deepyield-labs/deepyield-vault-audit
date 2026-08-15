@@ -4345,7 +4345,9 @@ library MainV2Liquidation {
 
     error InvalidAmount();
     error SwapCapExceeded(uint256 requested, uint256 cap);
+    error DailySwapCapExceeded(uint256 requested, uint256 cap);
     error SwapBelowFloor(uint256 floor, uint256 amountOut);
+    error InventoryDeltaMismatch(uint256 reported, uint256 observed);
     error InventoryRemaining(uint256 pairedBalance);
     error RewardInventoryRemaining(uint256 rewardBalance);
 
@@ -4368,13 +4370,23 @@ library MainV2Liquidation {
         uint256 headroom = used >= jobCap ? 0 : jobCap - used;
         notional = priceGuard.fairValue(WBNB, USDT, balance);
         amountIn = balance;
-        // Slice down to per-job headroom only on a non-final chunk. A final chunk
-        // whose notional exceeds the cap still reverts SwapCapExceeded in
+        uint256 sliceHeadroom = headroom;
+        uint256 dailyUsed;
+        if (!p.emergency) {
+            dailyUsed = dailySwapNotional[uint64(block.timestamp / 1 days)];
+            uint256 dailyHeadroom = dailyUsed >= p.dailySwapLimit ? 0 : p.dailySwapLimit - dailyUsed;
+            if (dailyHeadroom < sliceHeadroom) sliceHeadroom = dailyHeadroom;
+        }
+        // Slice down to the lesser job/daily headroom only on a non-final chunk. A final chunk
+        // whose notional exceeds a job or daily cap still reverts in
         // reserveSwapNotional (single-call cap semantics unchanged); an oversized
         // residual is drained by issuing non-final chunks first.
-        if (notional > headroom && !p.finalChunk) {
+        if (notional > sliceHeadroom && !p.finalChunk) {
             if (headroom == 0) revert SwapCapExceeded(notional, jobCap);
-            amountIn = FullMath.mulDiv(balance, headroom, notional);
+            if (!p.emergency && sliceHeadroom == 0) {
+                revert DailySwapCapExceeded(dailyUsed + notional, p.dailySwapLimit);
+            }
+            amountIn = FullMath.mulDiv(balance, sliceHeadroom, notional);
             if (amountIn == 0) revert SwapCapExceeded(notional, jobCap);
             notional = priceGuard.fairValue(WBNB, USDT, amountIn);
         }
@@ -4387,9 +4399,14 @@ library MainV2Liquidation {
         // observe an exhausted budget and incorrectly replace the emergency
         // floor with the normal floor.
         uint256 floor = priceGuard.minimumOut(WBNB, USDT, amountIn, p.emergency);
+        uint256 assetBefore = IERC20(USDT).balanceOf(address(this));
         pairedToken.forceApprove(address(executionAdapter), amountIn);
-        amountOut = executionAdapter.swapPairedToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
+        uint256 reportedOut = executionAdapter.swapPairedToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
         pairedToken.forceApprove(address(executionAdapter), 0);
+        uint256 assetAfter = IERC20(USDT).balanceOf(address(this));
+        if (assetAfter < assetBefore) revert InventoryDeltaMismatch(reportedOut, 0);
+        amountOut = assetAfter - assetBefore;
+        if (reportedOut != amountOut) revert InventoryDeltaMismatch(reportedOut, amountOut);
         if (amountOut < floor) revert SwapBelowFloor(floor, amountOut);
 
         if (p.finalChunk) {
@@ -4421,9 +4438,19 @@ library MainV2Liquidation {
         uint256 headroom = used >= jobCap ? 0 : jobCap - used;
         notional = rewardPriceGuard.fairValue(balance);
         amountIn = balance;
-        if (notional > headroom && !p.finalChunk) {
+        uint256 sliceHeadroom = headroom;
+        uint256 dailyUsed;
+        if (!p.emergency) {
+            dailyUsed = dailySwapNotional[uint64(block.timestamp / 1 days)];
+            uint256 dailyHeadroom = dailyUsed >= p.dailySwapLimit ? 0 : p.dailySwapLimit - dailyUsed;
+            if (dailyHeadroom < sliceHeadroom) sliceHeadroom = dailyHeadroom;
+        }
+        if (notional > sliceHeadroom && !p.finalChunk) {
             if (headroom == 0) revert SwapCapExceeded(notional, jobCap);
-            amountIn = FullMath.mulDiv(balance, headroom, notional);
+            if (!p.emergency && sliceHeadroom == 0) {
+                revert DailySwapCapExceeded(dailyUsed + notional, p.dailySwapLimit);
+            }
+            amountIn = FullMath.mulDiv(balance, sliceHeadroom, notional);
             if (amountIn == 0) revert SwapCapExceeded(notional, jobCap);
             notional = rewardPriceGuard.fairValue(amountIn);
         }
@@ -4432,9 +4459,15 @@ library MainV2Liquidation {
         );
 
         uint256 floor = rewardPriceGuard.minimumOut(amountIn, p.emergency);
+        uint256 assetBefore = IERC20(USDT).balanceOf(address(this));
         rewardToken.forceApprove(address(rewardExecutionAdapter), amountIn);
-        amountOut = rewardExecutionAdapter.swapRewardToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
+        uint256 reportedOut =
+            rewardExecutionAdapter.swapRewardToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
         rewardToken.forceApprove(address(rewardExecutionAdapter), 0);
+        uint256 assetAfter = IERC20(USDT).balanceOf(address(this));
+        if (assetAfter < assetBefore) revert InventoryDeltaMismatch(reportedOut, 0);
+        amountOut = assetAfter - assetBefore;
+        if (reportedOut != amountOut) revert InventoryDeltaMismatch(reportedOut, amountOut);
         if (amountOut < floor) revert SwapBelowFloor(floor, amountOut);
 
         if (p.finalChunk) {
@@ -4509,6 +4542,7 @@ library MainV2Open {
     error OpenNotTwoSided();
     error MintValueBelowFloor(uint256 expectedMinimum, uint256 actualValue);
     error InvalidPositionId();
+    error SwapBelowFloor(uint256 floor, uint256 amountOut);
     error JobKindMismatch(JobKind expected, JobKind actual);
     error JobAlreadyCompleted();
 
@@ -4522,6 +4556,7 @@ library MainV2Open {
         mapping(bytes32 => mapping(uint32 => bool)) storage usedChunks,
         mapping(uint64 => uint256) storage dailySwapNotional,
         IVaultBExecutionAdapterV2 executionAdapter,
+        IVaultBPriceGuard priceGuard,
         IERC20 asset,
         SwapChunkCall memory c
     ) external returns (uint256 pairedOut) {
@@ -4545,9 +4580,14 @@ library MainV2Open {
         // across all of them. Liquidations keep the per-job `reserveSwapNotional`.
         MainV2Jobs.reserveSwapChunk(dailySwapNotional, job, c.amountIn, c.swapPerJobCap, c.dailySwapLimit);
 
+        // This Main-level normal-policy floor remains meaningful even if an
+        // adapter accepts a lower calldata minimum. The caller independently
+        // verifies the returned amount against the observed WBNB balance delta.
+        uint256 floor = priceGuard.minimumOut(USDT, WBNB, c.amountIn, false);
         asset.forceApprove(address(executionAdapter), c.amountIn);
         pairedOut = executionAdapter.swapAssetToPaired(c.amountIn, c.keeperMinOut, c.deadline, false);
         asset.forceApprove(address(executionAdapter), 0);
+        if (pairedOut < floor) revert SwapBelowFloor(floor, pairedOut);
 
         job.cumulativeInput += c.amountIn;
         job.cumulativeOutput += pairedOut;
@@ -4969,6 +5009,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
                 || venue.poolAddress() != VAULT_B_POOL
         ) revert InvalidVenueIdentity();
         if (activePositionId != 0) revert PositionActive();
+        if (activeOpenJobId != bytes32(0)) revert OpenSeriesActive(activeOpenJobId);
         // Liveness is determined by inventory Main observed through canonical
         // protocol calls, never by a permissionless ERC-20 donation.
         if (accountedPairedInventory > PAIRED_DUST_TOLERANCE) {
@@ -5186,6 +5227,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         bytes32 active = activeOpenJobId;
         if (active == bytes32(0)) revert NoActiveOpenSeries();
         if (active != jobId) revert OpenSeriesActive(active);
+        if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
         // The swap leg is bounded by the RESERVED position budget (itself <= canaryOpenCap),
         // enforced inside MainV2Open AFTER chunk-sequencing so a duplicate/sparse chunk
         // still reports its own error rather than the budget bound.
@@ -5195,6 +5237,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
             usedChunks,
             dailySwapNotional,
             executionAdapter,
+            priceGuard,
             asset,
             SwapChunkCall(
                 jobId,
@@ -5280,7 +5323,12 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (accountedPairedInventory > PAIRED_DUST_TOLERANCE) revert InventoryPresent(accountedPairedInventory);
         activeOpenJobId = bytes32(0);
         delete openSeriesContext; // B11-T1: a cancelled series leaves no budget to inherit
-        MainV2Jobs.completeJob(jobs[jobId]);
+        Job storage job = jobs[jobId];
+        // A reservation precedes the first chunk, so a cancelled never-started
+        // series has no job record yet. Preserve its OPEN identity before marking
+        // the terminal status, which prevents a later jobId reuse under a NONE kind.
+        if (job.status == JobStatus.NONE) job.kind = JobKind.OPEN;
+        MainV2Jobs.completeJob(job);
         emit OpenSeriesCancelled(jobId);
     }
 
@@ -5343,6 +5391,10 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         uint256 positionId = activePositionId;
         if (positionId == 0) revert NoActivePosition();
         _commitWithdrawalCycleIfQueued();
+        // Unstaking leaves the LP manually staged for the guardian. Freeze an
+        // operating vault at the same queue-commit boundary, but never weaken
+        // a pre-existing HALT.
+        if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
         (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.forceUnstakeAndCredit(
             venue, pairedToken, rewardToken, positionId, accountedPairedInventory, accountedRewardInventory
         );
@@ -5391,6 +5443,10 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         uint256 positionId = activePositionId;
         if (positionId == 0) revert NoActivePosition();
         if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
+        // A request can arrive after an empty-queue unstake and before this
+        // realization step. Commit its Vault snapshot before any Venue preview
+        // or decrease so it cannot be cancelled after manual close advances.
+        _commitWithdrawalCycleIfQueued();
         (uint256 amount0Min, uint256 amount1Min) = MainV2Inventory.recoveryDecreaseMinimums(
             venue,
             priceGuard,
@@ -5421,6 +5477,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     function recoverCloseCollect() external onlyRole(GUARDIAN_ROLE) nonReentrant {
         uint256 positionId = activePositionId;
         if (positionId == 0) revert NoActivePosition();
+        _commitWithdrawalCycleIfQueued();
         if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
         (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.closeCollectAndCredit(
             address(venue), pairedToken, rewardToken, positionId, accountedPairedInventory, accountedRewardInventory
@@ -5434,6 +5491,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     function recoverCloseBurn() external onlyRole(GUARDIAN_ROLE) nonReentrant {
         uint256 positionId = activePositionId;
         if (positionId == 0) revert NoActivePosition();
+        _commitWithdrawalCycleIfQueued();
         if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
         (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.closeBurnAndCredit(
             address(venue), pairedToken, rewardToken, positionId, accountedPairedInventory, accountedRewardInventory
@@ -5493,6 +5551,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
         else _checkRole(KEEPER_ROLE, msg.sender);
         if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
         // Body in the linked MainV2Liquidation (EIP-170); it runs via delegatecall,
         // so token balances/approvals and the mapping pointers act on this
         // contract. Main keeps the role/halt gate and the loss journal + event.
@@ -5539,6 +5598,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
         else _checkRole(KEEPER_ROLE, msg.sender);
         if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
         // Body in the linked MainV2Liquidation (EIP-170), same delegatecall
         // arrangement as liquidateAllWbnb.
         uint256 amountIn;
@@ -5714,11 +5774,11 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
 
     uint256 public accountedAssets;
     uint256 public panicNonce;
-    /// @notice Fee assets pulled from Main but not yet accepted by the fee sink
-    /// (the sink reverted). Held in this adapter as an obligation owed to
-    /// `feeRecipient` and remitted later via `remitFee()`. Excluded from vault
-    /// NAV: it lives in this adapter's own balance, which `estimatedTotalAssets`
-    /// (Main assets only) does not count.
+    /// @notice Fee assets pulled from Main but not accepted in full by the fee
+    /// sink (it reverted or under-pulled). Held in this adapter as an
+    /// obligation owed to `feeRecipient` and remitted later via `remitFee()`.
+    /// Excluded from vault NAV: it lives in this adapter's own balance, which
+    /// `estimatedTotalAssets` (Main assets only) does not count.
     uint256 public unremittedFee;
 
     error NotVault();
@@ -5804,7 +5864,7 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
     /// @notice Canonical Main callback used immediately before an automatic
     /// withdrawal-cycle commit. It makes the Vault snapshot authoritative before
     /// Main starts an irreversible close step.
-    function prepareWithdrawalCycleCommit() external {
+    function prepareWithdrawalCycleCommit() external nonReentrant {
         if (msg.sender != address(main)) revert NotMain();
         IVaultBRedeemCycleCommit(vault).prepareRedeemCycleCommit();
     }
@@ -5914,7 +5974,7 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
             withdrawn = _pullIdle(idle);
             asset.safeTransfer(vault, withdrawn);
         }
-        accountedAssets = 0;
+        accountedAssets = asset.balanceOf(address(main));
     }
 
     function harvest() external onlyRole(MANAGER_ROLE) nonReentrant returns (uint256 profit, uint256 feeAssets) {
@@ -5930,6 +5990,15 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         main.halt();
         uint256 positionId = main.activePositionId();
         if (positionId != 0) {
+            // Main normally snapshots the Vault through this Adapter immediately
+            // before an automatic close-side commit. During panic this Adapter
+            // already holds the reentrancy lock, so pre-snapshot and commit the
+            // queue here before Main starts its one-way LP close. Main then sees
+            // an already committed cycle and cannot callback into this lock.
+            if (main.queuedWithdrawalCount() != 0 && !main.withdrawalCycleCommitted()) {
+                IVaultBRedeemCycleCommit(vault).prepareRedeemCycleCommit();
+                main.commitWithdrawalCycle();
+            }
             bytes32 jobId = keccak256(abi.encode("ADAPTER_PANIC", address(this), ++panicNonce, positionId));
             main.closeToInventory(jobId, block.timestamp + 60, true);
             main.halt();
@@ -5994,7 +6063,12 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         try feeSink.recordFee(amount) {
             asset.forceApprove(feeRecipient, 0);
             uint256 paid = beforeBalance - asset.balanceOf(address(this));
-            if (paid != amount) revert FeeSinkPullMismatch(amount, paid);
+            if (paid > amount) revert FeeSinkPullMismatch(amount, paid);
+            uint256 unpaid = amount - paid;
+            if (unpaid != 0) {
+                unremittedFee += unpaid;
+                emit FeeRemittanceDeferred(unpaid, unremittedFee);
+            }
         } catch {
             // Sink unavailable (paused, blacklist, treasury-mode, or a bug):
             // do NOT revert the user's withdrawal. Keep the fee assets in this

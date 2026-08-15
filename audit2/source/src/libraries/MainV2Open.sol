@@ -68,6 +68,7 @@ library MainV2Open {
     error OpenNotTwoSided();
     error MintValueBelowFloor(uint256 expectedMinimum, uint256 actualValue);
     error InvalidPositionId();
+    error SwapBelowFloor(uint256 floor, uint256 amountOut);
     error JobKindMismatch(JobKind expected, JobKind actual);
     error JobAlreadyCompleted();
 
@@ -81,6 +82,7 @@ library MainV2Open {
         mapping(bytes32 => mapping(uint32 => bool)) storage usedChunks,
         mapping(uint64 => uint256) storage dailySwapNotional,
         IVaultBExecutionAdapterV2 executionAdapter,
+        IVaultBPriceGuard priceGuard,
         IERC20 asset,
         SwapChunkCall memory c
     ) external returns (uint256 pairedOut) {
@@ -104,9 +106,14 @@ library MainV2Open {
         // across all of them. Liquidations keep the per-job `reserveSwapNotional`.
         MainV2Jobs.reserveSwapChunk(dailySwapNotional, job, c.amountIn, c.swapPerJobCap, c.dailySwapLimit);
 
+        // This Main-level normal-policy floor remains meaningful even if an
+        // adapter accepts a lower calldata minimum. The caller independently
+        // verifies the returned amount against the observed WBNB balance delta.
+        uint256 floor = priceGuard.minimumOut(USDT, WBNB, c.amountIn, false);
         asset.forceApprove(address(executionAdapter), c.amountIn);
         pairedOut = executionAdapter.swapAssetToPaired(c.amountIn, c.keeperMinOut, c.deadline, false);
         asset.forceApprove(address(executionAdapter), 0);
+        if (pairedOut < floor) revert SwapBelowFloor(floor, pairedOut);
 
         job.cumulativeInput += c.amountIn;
         job.cumulativeOutput += pairedOut;
