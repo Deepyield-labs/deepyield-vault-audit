@@ -49,6 +49,9 @@ library MainV2Liquidation {
     error InventoryDeltaMismatch(uint256 reported, uint256 observed);
     error InventoryRemaining(uint256 pairedBalance);
     error RewardInventoryRemaining(uint256 rewardBalance);
+    error RewardGuardQuoteMismatch(
+        uint256 snapshotNotional, uint256 billedNotional, bool selectedEmergency, bool billedEmergency
+    );
 
     function liquidateWbnb(
         mapping(bytes32 => Job) storage jobs,
@@ -132,36 +135,79 @@ library MainV2Liquidation {
         uint256 balance = rewardToken.balanceOf(address(this));
         if (balance == 0) revert InvalidAmount();
 
-        uint256 jobCap = p.emergency ? p.hardMaxActiveAssets : p.swapPerJobCap;
+        uint256 fairNotional;
+        uint256 capNotional;
+        uint256 normalCapacity;
+        uint256 emergencyCapacity;
+        (fairNotional, capNotional, normalCapacity, emergencyCapacity) =
+            rewardPriceGuard.liquidationSnapshot(balance, p.emergency);
+
+        // Wider terms are selected only when the validated source spread does
+        // not fit normal policy. A calm market always retains normal job/daily
+        // caps and the normal loss floor even if an emergency window is live.
+        bool selectedEmergency = p.emergency && normalCapacity == 0;
+        if (selectedEmergency && emergencyCapacity == 0) revert SwapCapExceeded(capNotional, 0);
+
+        uint256 jobCap = selectedEmergency ? p.hardMaxActiveAssets : p.swapPerJobCap;
         uint256 used = job.cumulativeNotionalAsset;
         uint256 headroom = used >= jobCap ? 0 : jobCap - used;
-        notional = rewardPriceGuard.fairValue(balance);
         amountIn = balance;
         uint256 sliceHeadroom = headroom;
         uint256 dailyUsed;
-        if (!p.emergency) {
+        if (!selectedEmergency) {
             dailyUsed = dailySwapNotional[uint64(block.timestamp / 1 days)];
             uint256 dailyHeadroom = dailyUsed >= p.dailySwapLimit ? 0 : p.dailySwapLimit - dailyUsed;
             if (dailyHeadroom < sliceHeadroom) sliceHeadroom = dailyHeadroom;
         }
-        if (notional > sliceHeadroom && !p.finalChunk) {
-            if (headroom == 0) revert SwapCapExceeded(notional, jobCap);
-            if (!p.emergency && sliceHeadroom == 0) {
-                revert DailySwapCapExceeded(dailyUsed + notional, p.dailySwapLimit);
+        uint256 guardCapacity = selectedEmergency ? emergencyCapacity : normalCapacity;
+        if (guardCapacity < sliceHeadroom) sliceHeadroom = guardCapacity;
+
+        if (capNotional > sliceHeadroom && !p.finalChunk) {
+            if (headroom == 0) revert SwapCapExceeded(capNotional, jobCap);
+            if (!selectedEmergency && sliceHeadroom == 0 && dailyUsed >= p.dailySwapLimit) {
+                revert DailySwapCapExceeded(dailyUsed + capNotional, p.dailySwapLimit);
             }
-            amountIn = FullMath.mulDiv(balance, sliceHeadroom, notional);
-            if (amountIn == 0) revert SwapCapExceeded(notional, jobCap);
-            notional = rewardPriceGuard.fairValue(amountIn);
+            if (sliceHeadroom == 0) revert SwapCapExceeded(capNotional, guardCapacity);
+            // Leave one unit of cap-notional rounding slack only for the wide
+            // emergency band. Normal liquidation retains its exact historical
+            // slice, while the caller-rounded emergency upper reference cannot
+            // land one unit above the remaining guard capacity.
+            uint256 sliceDenominator = selectedEmergency ? capNotional + 1 : capNotional;
+            amountIn = FullMath.mulDiv(balance, sliceHeadroom, sliceDenominator);
+            if (amountIn == 0) revert SwapCapExceeded(capNotional, jobCap);
+            (fairNotional, capNotional, normalCapacity, emergencyCapacity) =
+                rewardPriceGuard.liquidationSnapshot(amountIn, p.emergency);
+            guardCapacity = selectedEmergency ? emergencyCapacity : normalCapacity;
+            if (capNotional > sliceHeadroom || capNotional > guardCapacity) {
+                revert SwapCapExceeded(capNotional, sliceHeadroom);
+            }
+        } else if (capNotional > sliceHeadroom) {
+            // A final chunk cannot silently turn a bounded liquidation into an
+            // oversized one; revert before any approval or token transfer.
+            revert SwapCapExceeded(capNotional, sliceHeadroom);
+        }
+
+        uint256 floor;
+        uint256 billedNotional;
+        bool billedEmergency;
+        (floor, billedNotional, billedEmergency) = rewardPriceGuard.minimumOutAndBudget(amountIn, selectedEmergency);
+        if (billedNotional != capNotional || billedEmergency != selectedEmergency) {
+            revert RewardGuardQuoteMismatch(capNotional, billedNotional, selectedEmergency, billedEmergency);
         }
         MainV2Jobs.reserveSwapNotional(
-            dailySwapNotional, job, notional, p.emergency, p.hardMaxActiveAssets, p.swapPerJobCap, p.dailySwapLimit
+            dailySwapNotional,
+            job,
+            billedNotional,
+            selectedEmergency,
+            p.hardMaxActiveAssets,
+            p.swapPerJobCap,
+            p.dailySwapLimit
         );
 
-        uint256 floor = rewardPriceGuard.minimumOut(amountIn, p.emergency);
         uint256 assetBefore = IERC20(USDT).balanceOf(address(this));
         rewardToken.forceApprove(address(rewardExecutionAdapter), amountIn);
         uint256 reportedOut =
-            rewardExecutionAdapter.swapRewardToAsset(amountIn, p.keeperMinOut, p.deadline, p.emergency);
+            rewardExecutionAdapter.swapRewardToAsset(amountIn, p.keeperMinOut, p.deadline, selectedEmergency);
         rewardToken.forceApprove(address(rewardExecutionAdapter), 0);
         uint256 assetAfter = IERC20(USDT).balanceOf(address(this));
         if (assetAfter < assetBefore) revert InventoryDeltaMismatch(reportedOut, 0);
@@ -177,5 +223,8 @@ library MainV2Liquidation {
 
         job.cumulativeInput += amountIn;
         job.cumulativeOutput += amountOut;
+        // Main's redeem-cycle loss journal must compare execution with the
+        // lower/fair value, never with the stronger upper cap reference.
+        notional = fairNotional;
     }
 }

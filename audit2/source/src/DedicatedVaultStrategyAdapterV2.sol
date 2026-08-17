@@ -114,9 +114,10 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         _crystallizeFeeDirect();
         withdrawn = _pullIdle(assetsNeeded);
         asset.safeTransfer(vault, withdrawn);
-        // Resync basis to Main's actual remaining idle (covers the loss path,
-        // where the old flat subtraction left a stale, too-high basis).
-        accountedAssets = asset.balanceOf(address(main));
+        // A partial exit reduces the high-water basis by the amount returned,
+        // not by Main's raw post-loss balance. Otherwise a realized loss is
+        // silently forgotten and its recovery is charged as fresh profit.
+        _reduceAccountedAssetsForWithdrawal(withdrawn);
         emit WithdrawnToVault(withdrawn);
     }
 
@@ -159,11 +160,11 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
             emit PerformanceFeeCharged(profit, feeAssets);
         }
         if (assetsNeeded != 0) asset.safeTransfer(vault, assetsNeeded);
-        // Resync basis to Main's actual remaining idle after this withdrawal and
-        // any realized fee that left Main — for BOTH profit and loss paths. The
-        // realized fee left Main whether or not the sink accepted it, so the
-        // deferred obligation is never counted into the basis twice.
-        accountedAssets = asset.balanceOf(address(main));
+        // The Main pull includes both the user assets and the crystallized fee.
+        // Preserve a loss high-water mark across a partial exit, but remove
+        // both components from that mark once they have left Main.
+        if (profit != 0) accountedAssets += profit;
+        _reduceAccountedAssetsForWithdrawal(pullAmount);
         emit WithdrawalForwarded(requestId, assetsNeeded, feeAssets);
         return assetsNeeded;
     }
@@ -314,6 +315,20 @@ contract DedicatedVaultStrategyAdapterV2 is IVaultBAsyncStrategy, AccessControl,
         if (grossAssets <= accountedAssets) return (0, 0);
         profit = grossAssets - accountedAssets;
         feeAssets = profit * performanceFeeBps / BPS;
+    }
+
+    /// @dev A complete drain has no remaining shareholder basis. On a partial
+    /// withdrawal, however, raw Main inventory can be below the high-water
+    /// basis because of a realized loss; syncing to that raw balance would
+    /// charge the loss recovery as new profit.
+    function _reduceAccountedAssetsForWithdrawal(uint256 withdrawn) internal {
+        if (asset.balanceOf(address(main)) == 0) {
+            accountedAssets = 0;
+        } else if (withdrawn >= accountedAssets) {
+            accountedAssets = 0;
+        } else {
+            accountedAssets -= withdrawn;
+        }
     }
 
     function _pullIdle(uint256 amount) internal returns (uint256 pulled) {

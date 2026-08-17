@@ -363,6 +363,17 @@ interface IVaultBExecutionAdapterV2 {
 interface IVaultBRewardPriceGuard {
     function DIRECT_ORACLE_FEE() external view returns (uint24);
 
+    /// @notice Un-haircut CAKE liquidation data for Main's bounded chunk
+    /// selection. This view neither reserves nor consumes emergency capacity.
+    /// `fairNotional` is the conservative lower source; `capNotional` is the
+    /// conservative upper source. `normalCapacity` is zero when the source
+    /// spread needs the wider emergency deviation band. `emergencyCapacity`
+    /// is the remaining active emergency allocation for an emergency request.
+    function liquidationSnapshot(uint256 amountIn, bool requestedEmergency)
+        external
+        view
+        returns (uint256 fairNotional, uint256 capNotional, uint256 normalCapacity, uint256 emergencyCapacity);
+
     function minimumOut(uint256 amountIn, bool emergency) external view returns (uint256 minOut);
 
     function minimumOutAndBudget(uint256 amountIn, bool emergency)
@@ -3231,8 +3242,10 @@ interface IChainlinkBounds {
 }
 
 /// @notice On-chain lower bound for Vault B CAKE-to-USDT liquidation.
-/// It cross-checks a direct CAKE/USDT TWAP against an independent
-/// CAKE/WBNB TWAP converted through Chainlink BNB/USD and USDT/USD.
+/// It cross-checks a direct CAKE/USDT TWAP, a CAKE/WBNB TWAP converted through
+/// Chainlink BNB/USD and USDT/USD, and the independent Chainlink CAKE/USD
+/// reference. A disagreement fails closed rather than accepting a floor from
+/// two correlated PancakeSwap pools.
 contract VaultBCakePriceGuard is AccessControlDefaultAdminRules, IVaultBRewardPriceGuard {
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
     bytes32 public constant EMERGENCY_CONSUMER_ROLE = keccak256("EMERGENCY_CONSUMER_ROLE");
@@ -3249,6 +3262,11 @@ contract VaultBCakePriceGuard is AccessControlDefaultAdminRules, IVaultBRewardPr
     address public constant CAKE_WBNB_ORACLE_POOL = 0xAfB2Da14056725E3BA3a30dD846B6BBbd7886c56;
     address public constant BNB_USD_FEED = 0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE;
     address public constant USDT_USD_FEED = 0xB97Ad0E74fa7d920791E90258A6E2085088b4320;
+    address public constant CAKE_USD_FEED = 0xB6064eD41d4f67e353768aA239cA86f4F73665a1;
+    /// @dev The official BNB-chain catalog currently specifies a 60-second
+    /// heartbeat for CAKE/USD. Five heartbeats allow normal propagation but
+    /// fail closed on an unavailable or migrated feed.
+    uint32 public constant MAX_CAKE_USD_FEED_AGE = 300;
 
     uint24 public constant override DIRECT_ORACLE_FEE = 2_500;
     uint24 public constant CROSS_ORACLE_FEE = 500;
@@ -3257,6 +3275,7 @@ contract VaultBCakePriceGuard is AccessControlDefaultAdminRules, IVaultBRewardPr
     IPancakeV3Pool public constant crossPool = IPancakeV3Pool(CAKE_WBNB_ORACLE_POOL);
     IChainlinkAggregatorV3 public constant bnbUsdFeed = IChainlinkAggregatorV3(BNB_USD_FEED);
     IChainlinkAggregatorV3 public constant usdtUsdFeed = IChainlinkAggregatorV3(USDT_USD_FEED);
+    IChainlinkAggregatorV3 public constant cakeUsdFeed = IChainlinkAggregatorV3(CAKE_USD_FEED);
 
     uint16 public immutable normalLossBps;
     uint16 public immutable maxEmergencyLossBps;
@@ -3284,6 +3303,7 @@ contract VaultBCakePriceGuard is AccessControlDefaultAdminRules, IVaultBRewardPr
     error FutureOracleTimestamp(address feed, uint256 timestamp);
     error UnsupportedOracleDecimals(address feed, uint8 decimals);
     error OracleDeviation(uint256 directOut, uint256 compositeOut, uint256 deviationBps);
+    error ExternalReferenceDeviation(uint256 poolReferenceOut, uint256 cakeFeedOut, uint256 deviationBps);
     error OracleAtBound(address feed, int256 answer, int192 minAnswer, int192 maxAnswer);
     error CapacityExceeded(uint256 notional, uint256 cap);
     error TwapUnavailable(address pool);
@@ -3305,6 +3325,16 @@ contract VaultBCakePriceGuard is AccessControlDefaultAdminRules, IVaultBRewardPr
         uint256 emergencyNotional;
         uint16 lossBps;
         bool emergencyBudgetUsed;
+    }
+
+    /// @dev Internal source data that keeps the existing public `Quote` ABI
+    /// stable while allowing a capacity-free preflight to validate every
+    /// source before Main chooses a bounded slice.
+    struct RawQuote {
+        Quote quote;
+        uint256 poolUpper;
+        uint256 cakeFeedOutLower;
+        uint256 poolDeviationBps;
     }
 
     constructor(
@@ -3410,6 +3440,34 @@ contract VaultBCakePriceGuard is AccessControlDefaultAdminRules, IVaultBRewardPr
         return _sourceQuote(amountIn, false).fairOut;
     }
 
+    /// @notice Capacity-free source snapshot for Main's reward-liquidation
+    /// slicing. It deliberately does not apply a loss haircut, reserve a
+    /// budget, or require the unsliced balance to fit a per-call cap.
+    function liquidationSnapshot(uint256 amountIn, bool requestedEmergency)
+        external
+        view
+        returns (uint256 fairNotional, uint256 capNotional, uint256 normalCapacity, uint256 emergencyCapacity)
+    {
+        RawQuote memory raw = _rawSourceQuote(amountIn);
+        if (!requestedEmergency) {
+            _validateSourceDeviation(raw, false);
+            return (raw.quote.fairOut, raw.quote.floorReferenceOut, maxNormalNotional, 0);
+        }
+
+        // Keep the same active-window/configuration requirement as a true
+        // emergency quote, but do not let an insufficient *unsliced* amount
+        // select normal policy before Main has a chance to make a bounded
+        // emergency slice.
+        _lossBudget(true, 1);
+        _validateSourceDeviation(raw, true);
+
+        uint256 consumed = emergencyNotionalConsumed;
+        uint256 remaining = consumed >= emergencyNotionalLimit ? 0 : emergencyNotionalLimit - consumed;
+        emergencyCapacity = remaining < maxEmergencyNotional ? remaining : maxEmergencyNotional;
+        normalCapacity = _sourceDeviationWithin(raw, false) ? maxNormalNotional : 0;
+        return (raw.quote.fairOut, raw.quote.floorReferenceOut, normalCapacity, emergencyCapacity);
+    }
+
     function quote(uint256 amountIn, bool emergency) public view returns (Quote memory q) {
         q = _sourceQuote(amountIn, emergency);
         (q.lossBps, q.emergencyBudgetUsed) = _lossBudget(emergency, q.emergencyNotional);
@@ -3421,33 +3479,56 @@ contract VaultBCakePriceGuard is AccessControlDefaultAdminRules, IVaultBRewardPr
     }
 
     function _sourceQuote(uint256 amountIn, bool emergency) internal view returns (Quote memory q) {
+        RawQuote memory raw = _rawSourceQuote(amountIn);
+        q = raw.quote;
+        (, q.emergencyBudgetUsed) = _lossBudget(emergency, q.emergencyNotional);
+        _validateSourceDeviation(raw, q.emergencyBudgetUsed);
+    }
+
+    function _rawSourceQuote(uint256 amountIn) internal view returns (RawQuote memory raw) {
         if (amountIn == 0) revert InvalidAmount();
 
+        Quote memory q = raw.quote;
         q.directTwapOut = _twapQuote(directPool, amountIn, CAKE, USDT);
         uint256 wbnbOut = _twapQuote(crossPool, amountIn, CAKE, WBNB);
         uint256 bnbUsd = _readFeed(bnbUsdFeed, maxBnbFeedAge);
         uint256 usdtUsd = _readFeed(usdtUsdFeed, maxUsdtFeedAge);
         q.compositeTwapOut = FullMath.mulDiv(wbnbOut, bnbUsd, usdtUsd);
-        if (q.directTwapOut == 0 || q.compositeTwapOut == 0) revert InvalidAmount();
+        uint256 cakeUsd = _readFeed(cakeUsdFeed, MAX_CAKE_USD_FEED_AGE);
+        raw.cakeFeedOutLower = FullMath.mulDiv(amountIn, cakeUsd, usdtUsd);
+        uint256 cakeFeedOutUpper = FullMath.mulDivRoundingUp(amountIn, cakeUsd, usdtUsd);
+        if (q.directTwapOut == 0 || q.compositeTwapOut == 0 || raw.cakeFeedOutLower == 0) revert InvalidAmount();
 
-        uint256 lower = q.directTwapOut < q.compositeTwapOut ? q.directTwapOut : q.compositeTwapOut;
-        uint256 upper = q.directTwapOut > q.compositeTwapOut ? q.directTwapOut : q.compositeTwapOut;
-        q.deviationBps = FullMath.mulDivRoundingUp(upper - lower, BPS, lower);
+        uint256 poolLower = q.directTwapOut < q.compositeTwapOut ? q.directTwapOut : q.compositeTwapOut;
+        raw.poolUpper = q.directTwapOut > q.compositeTwapOut ? q.directTwapOut : q.compositeTwapOut;
+        raw.poolDeviationBps = FullMath.mulDivRoundingUp(raw.poolUpper - poolLower, BPS, poolLower);
+        // The lower value remains conservative for accounting, while floor,
+        // capacity and emergency-notional accounting round against the caller.
+        uint256 lower = poolLower < raw.cakeFeedOutLower ? poolLower : raw.cakeFeedOutLower;
+        uint256 upper = raw.poolUpper > cakeFeedOutUpper ? raw.poolUpper : cakeFeedOutUpper;
         q.emergencyNotional = upper;
-        (, q.emergencyBudgetUsed) = _lossBudget(emergency, q.emergencyNotional);
+        q.deviationBps = FullMath.mulDivRoundingUp(upper - lower, BPS, lower);
+        q.fairOut = lower;
+        q.floorReferenceOut = upper;
+        raw.quote = q;
+    }
+
+    function _validateSourceDeviation(RawQuote memory raw, bool emergencyBandAvailable) internal view {
+        uint256 deviationLimit = emergencyBandAvailable ? maxEmergencyOracleDeviationBps : maxOracleDeviationBps;
         // Mode-dependent ceiling: emergencies tolerate a wider gap so the reward
         // emergency exit is not killed by a real market move; normal is unchanged;
         // an active guardian budget is still required by `_lossBudget`.
-        uint256 deviationLimit = q.emergencyBudgetUsed ? maxEmergencyOracleDeviationBps : maxOracleDeviationBps;
-        if (q.deviationBps > deviationLimit) {
-            revert OracleDeviation(q.directTwapOut, q.compositeTwapOut, q.deviationBps);
+        if (raw.poolDeviationBps > deviationLimit) {
+            revert OracleDeviation(raw.quote.directTwapOut, raw.quote.compositeTwapOut, raw.poolDeviationBps);
         }
+        if (raw.quote.deviationBps > deviationLimit) {
+            revert ExternalReferenceDeviation(raw.poolUpper, raw.cakeFeedOutLower, raw.quote.deviationBps);
+        }
+    }
 
-        q.fairOut = lower;
-        // `fairOut` stays conservative for accounting. The execution floor uses
-        // the stronger source, so moving only the thinner cross pool downward
-        // cannot silently add the entire source-deviation band to swap slippage.
-        q.floorReferenceOut = upper;
+    function _sourceDeviationWithin(RawQuote memory raw, bool emergencyBandAvailable) internal view returns (bool) {
+        uint256 deviationLimit = emergencyBandAvailable ? maxEmergencyOracleDeviationBps : maxOracleDeviationBps;
+        return raw.poolDeviationBps <= deviationLimit && raw.quote.deviationBps <= deviationLimit;
     }
 
     function _validatePool(IPancakeV3Pool candidate, address quoteToken, uint24 expectedFee) internal view {

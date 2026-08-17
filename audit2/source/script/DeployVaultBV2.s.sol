@@ -30,6 +30,11 @@ contract DeployVaultBV2 is Script {
     address internal constant POOL = 0x172fcD41E0913e95784454622d1c3724f546f849;
     address internal constant NFPM = 0x46A15B0b27311cedF172AB29E4f4766fbE7F4364;
     address internal constant MASTERCHEF = 0x556B9306565093C855AEA9AE92A594704c2Cd59e;
+    /// @dev A positive cap below USDT's one-token minimum deposit. Unlike a
+    /// zero cap (which means unlimited), this closes the root Vault's bootstrap
+    /// deposit window until the final graph is attested and its admin explicitly
+    /// installs `Config.vaultDepositCap`.
+    uint256 public constant BOOTSTRAP_DEPOSIT_CAP = 1;
 
     struct Config {
         address admin;
@@ -110,7 +115,7 @@ contract DeployVaultBV2 is Script {
             cfg.admin,
             cfg.guardian,
             cfg.vaultTreasury,
-            cfg.vaultDepositCap
+            BOOTSTRAP_DEPOSIT_CAP
         );
         // Partner attribution is off-chain for Vault B V2. The sink forwards
         // each successful fee directly to the project treasury and never
@@ -149,9 +154,6 @@ contract DeployVaultBV2 is Script {
         BoundedPancakeRewardAdapterV2 cakeExecutor = new BoundedPancakeRewardAdapterV2(
             deployer, IVaultBRewardPriceGuard(address(cakeGuard)), cfg.maxSwapDeadlineDelay
         );
-        wbnbGuard.grantRole(wbnbGuard.EMERGENCY_CONSUMER_ROLE(), address(wbnbExecutor));
-        cakeGuard.grantRole(cakeGuard.EMERGENCY_CONSUMER_ROLE(), address(cakeExecutor));
-
         uint64 base = vm.getNonce(deployer);
         address predictedVenue = vm.computeCreateAddress(deployer, base);
         address predictedMain = vm.computeCreateAddress(deployer, base + 1);
@@ -205,7 +207,19 @@ contract DeployVaultBV2 is Script {
 
         wbnbExecutor.bindMain(address(main));
         cakeExecutor.bindMain(address(main));
+        require(wbnbExecutor.main() == address(main) && cakeExecutor.main() == address(main), "adapter bind mismatch");
+        // A guard consumer is never authorized before its own immutable adapter
+        // has been bound to this exact Main. This leaves a recoverable prefix
+        // through tx 11 with no unbound emergency consumer.
+        wbnbGuard.grantRole(wbnbGuard.EMERGENCY_CONSUMER_ROLE(), address(wbnbExecutor));
+        cakeGuard.grantRole(cakeGuard.EMERGENCY_CONSUMER_ROLE(), address(cakeExecutor));
+        require(
+            wbnbGuard.hasRole(wbnbGuard.EMERGENCY_CONSUMER_ROLE(), address(wbnbExecutor))
+                && cakeGuard.hasRole(cakeGuard.EMERGENCY_CONSUMER_ROLE(), address(cakeExecutor)),
+            "emergency consumer mismatch"
+        );
         vault.setStrategy(address(adapter));
+        require(address(vault.strategy()) == address(adapter), "strategy assignment mismatch");
         main.grantRole(main.GUARDIAN_ROLE(), address(adapter));
         require(main.mode() == DedicatedVaultMainV2.Mode.HALTED, "must deploy halted");
 

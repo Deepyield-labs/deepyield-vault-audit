@@ -8,6 +8,10 @@ interface IVaultBDirectWithdrawalCancellation {
     function cancelWithdrawalFromVault(bytes32 requestId) external returns (bool canceled);
 }
 
+interface IVaultBDirectForceSettlement {
+    function forceClearWithdrawalFromVault(bytes32 requestId) external returns (bool cleared);
+}
+
 /// @notice Stateless strategy checks and recovery dispatch kept outside Vault B's
 /// runtime bytecode. No library function writes Vault storage.
 library VaultBDepositLib {
@@ -20,6 +24,15 @@ library VaultBDepositLib {
             bool canceled = IVaultBDirectWithdrawalCancellation(assetSource).cancelWithdrawalFromVault(requestId);
             if (!canceled) revert StrategyWiringMismatch();
         }
+    }
+
+    /// @notice Canonical journal release after Vault has fixed a zero-asset
+    /// force payout. The immutable Main accepts it only from the configured
+    /// root Vault while that Vault exposes its force-settled flag. Failure must
+    /// revert the whole claim: local settlement may not outrun Main's journal.
+    function forceClearWithdrawal(address assetSource, bytes32 requestId) external {
+        bool cleared = IVaultBDirectForceSettlement(assetSource).forceClearWithdrawalFromVault(requestId);
+        if (!cleared) revert StrategyWiringMismatch();
     }
 
     function validateCandidate(IVaultBAsyncStrategy candidate, address expectedAsset, address expectedVault)
@@ -63,7 +76,13 @@ library VaultBDepositLib {
         uint256 depositCap,
         uint256 claimableAssets
     ) external view returns (uint256) {
-        if (blocked) return 0;
+        // A Vault without its first strategy has no attested deployment graph
+        // behind it. This is an unconditional admission gate: neither an
+        // admin cap update nor an unpause may make ERC-4626 deposit/mint live
+        // before strategy installation. Direct ERC-20 donations remain assets
+        // (and therefore keep the immediate bootstrap `VaultNotEmpty` gate
+        // closed), but they never create shares through this path.
+        if (blocked || address(strategy) == address(0)) return 0;
 
         uint256 deployedUpper;
         uint256 deployedLower;

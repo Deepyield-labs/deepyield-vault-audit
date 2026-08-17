@@ -9,7 +9,7 @@ The requester supplied a prior independent review as context for the separate
 | Public gateway URL | `https://bafkreidqe54b2w5w2m3cuwnp6j6725ze7lr5cg6et3u5ml22mesoyv4ddy.ipfs.community.bgipfs.com/` |
 | Downloaded document SHA-256 | `7027781d5bb6d3362a59aff27dfd7724fae3d11bc49ee9d62f5a6124ec57831e` |
 | Historical repository commit | `a5a529b7044b74015c748e6fbeb443b4ad866fdc` |
-| Relationship to this package | Input only; it did not audit candidate `18c1beb5071605385ecc0276322d87e6c6ea5652` |
+| Relationship to this package | Input only; it did not audit candidate `27e1e617296dde8c0dc1ff621eeec3a3b10b409d` |
 
 The historical report recorded 1 High, 9 Medium, 10 Low, and 10 Informational
 items. It is not copied into this package. Verify the CID and SHA-256 before

@@ -74,7 +74,7 @@ contract BoundedPancakeExecutionAdapterV2 is IVaultBExecutionAdapterV2 {
         if (main != address(0)) revert AlreadyBound();
         if (
             main_ == address(0) || main_ == address(this) || main_ == binder || main_ == address(priceGuard)
-                || main_.code.length == 0
+                || main_ == USDT || main_ == WBNB || main_ == PANCAKE_V3_SWAP_ROUTER || main_.code.length == 0
         ) revert InvalidMain();
         main = main_;
         emit MainBound(main_);

@@ -13,19 +13,28 @@ interface IVaultBWithdrawalCycleCommitReceiver {
     function prepareWithdrawalCycleCommit() external;
 }
 
+interface IVaultBForceSettledRedeemCycle {
+    function redeemCycleForceSettled() external view returns (bool);
+}
+
 import {
     IVaultBExecutionAdapterV2,
     IVaultBPriceGuard,
     IVaultBRewardExecutionAdapterV2,
     IVaultBRewardPriceGuard
 } from "./interfaces/IVaultBExecutionV2.sol";
-import {FullMath} from "./libraries/FullMath.sol";
 import {MainV2Geometry} from "./libraries/MainV2Geometry.sol";
 import {MainV2Valuation} from "./libraries/MainV2Valuation.sol";
 import {JobKind, JobStatus, Job, MainV2Jobs} from "./libraries/MainV2Jobs.sol";
 import {MainV2Liquidation, LiqParams} from "./libraries/MainV2Liquidation.sol";
 import {MainV2Open, OpenCall, SwapChunkCall} from "./libraries/MainV2Open.sol";
-import {MainV2Inventory, CloseInventoryCall, CloseInventoryResult} from "./libraries/MainV2Inventory.sol";
+import {
+    MainV2Inventory,
+    CloseInventoryCall,
+    CloseInventoryResult,
+    RecoveryDecreasePlan,
+    RecoveryCollectResult
+} from "./libraries/MainV2Inventory.sol";
 
 /// @notice Vault B MainV2 prototype. It is intentionally deployed halted and
 /// direct-Pancake-only. Aggregator calldata is outside this contract's first
@@ -167,11 +176,21 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     mapping(uint64 => uint256) public dailySwapNotional;
     mapping(bytes32 => WithdrawalRequest) public withdrawals;
 
+    /// @dev Appended recovery loss basis: the canonical Venue owns stage
+    /// ordering. Main only snapshots one price basis, accumulates observed
+    /// proceeds across retryable collects, and journals after Venue accepts
+    /// burn. Appending preserves every pre-existing storage slot.
+    uint256 private _recoveryExpectedFairValue;
+    uint256 private _recoveryReferenceUsdtPerWbnb;
+    uint256 private _recoveryRealizedFairValue;
+    bool private _recoveryLossJournalArmed;
+
     error WrongChain(uint256 actual);
     error ZeroAddress();
     error InvalidConfiguration();
     error NotVault();
     error NotRedeemVault();
+    error ForceSettlementNotActive();
     error OpensDisabled(Mode mode);
     error AdapterNotBound();
     error InvalidExecutionAdapter();
@@ -206,6 +225,8 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     error SpotDivergedFromOracle(uint256 spotUsdtPerWbnb, uint256 oracleUsdtPerWbnb);
     error InvalidSpotOracleDeviation();
     error HaltedKeeperPath();
+    error StrandedPositionMismatch(uint256 expected, uint256 observed);
+    error EmergencyModeRequired();
     error LastAdminCannotBeRemoved();
     error WithdrawalExists();
     error WithdrawalUnknown();
@@ -240,7 +261,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     event RewardLiquidated(bytes32 indexed jobId, uint256 amountIn, uint256 amountOut, bool emergency);
     event PositionForceUnstaked(uint256 indexed positionId);
     event VenueCloseStageRecovered(uint256 indexed positionId, uint8 stage);
-    event VenuePositionWrittenOff(uint256 indexed positionId, uint256 strandedTokenId, bool inventoryReturned);
+    event VenuePositionWrittenOff(uint256 indexed positionId, uint256 strandedTokenId, bool pairedInventoryReturned);
     event WithdrawalRequested(bytes32 indexed requestId, uint256 assets);
     event WithdrawalCycleCommitted(uint256 requests);
     event WithdrawalExecutionLossRecorded(uint256 incrementalLoss, uint256 cumulativeLoss);
@@ -447,15 +468,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (request.status != WithdrawalStatus.REQUESTED) revert WithdrawalNotReady();
         if (!isWithdrawalReady()) revert WithdrawalNotReady();
         if (asset.balanceOf(address(this)) < amount) revert WithdrawalNotReady();
-        request.status = WithdrawalStatus.CLAIMED;
-        queuedWithdrawalAssets -= request.assets;
-        queuedWithdrawalCount -= 1;
-        if (queuedWithdrawalCount == 0 && withdrawalCycleCommitted) {
-            withdrawalCycleCommitted = false;
-            withdrawalCycleBatchCommitted = false;
-            withdrawalCycleExecutionLoss = 0;
-            emit WithdrawalCycleCleared();
-        }
+        _completeWithdrawal(request);
         if (amount != 0) asset.safeTransfer(vault, amount);
         emit WithdrawalClaimed(requestId, amount);
         return amount;
@@ -469,6 +482,35 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (msg.sender != redeemVault) revert NotRedeemVault();
         _cancelWithdrawal(requestId);
         return true;
+    }
+
+    /// @notice Root-Vault-only zero-asset release for its timeout force path.
+    /// It cannot transfer assets, and the immutable root must itself expose an
+    /// active force-settlement flag. This keeps the one-way Main journal aligned
+    /// when the adapter is unavailable but Main remains callable.
+    function forceClearWithdrawalFromVault(bytes32 requestId) external nonReentrant returns (bool cleared) {
+        if (msg.sender != redeemVault) revert NotRedeemVault();
+        if (!withdrawalCycleCommitted || !IVaultBForceSettledRedeemCycle(redeemVault).redeemCycleForceSettled()) {
+            revert ForceSettlementNotActive();
+        }
+        WithdrawalRequest storage request = withdrawals[requestId];
+        if (request.status == WithdrawalStatus.NONE) revert WithdrawalUnknown();
+        if (request.status != WithdrawalStatus.REQUESTED) revert WithdrawalNotReady();
+        _completeWithdrawal(request);
+        emit WithdrawalClaimed(requestId, 0);
+        return true;
+    }
+
+    function _completeWithdrawal(WithdrawalRequest storage request) internal {
+        request.status = WithdrawalStatus.CLAIMED;
+        queuedWithdrawalAssets -= request.assets;
+        queuedWithdrawalCount -= 1;
+        if (queuedWithdrawalCount == 0 && withdrawalCycleCommitted) {
+            withdrawalCycleCommitted = false;
+            withdrawalCycleBatchCommitted = false;
+            withdrawalCycleExecutionLoss = 0;
+            emit WithdrawalCycleCleared();
+        }
     }
 
     function _cancelWithdrawal(bytes32 requestId) internal {
@@ -501,13 +543,13 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     /// @notice Disabled: `vault` accounts only for USDT, so forwarding WBNB to
     /// it would strand the token. The bounded raw-balance liquidation path is
     /// the recovery route for any unaccounted balance.
-    function sweepPairedDust() external onlyRole(GUARDIAN_ROLE) nonReentrant returns (uint256) {
+    function sweepPairedDust() external pure returns (uint256) {
         revert InventorySweepDisabled();
     }
 
     /// @notice Disabled for the same reason as `sweepPairedDust`: the USDT vault
     /// cannot safely receive or account for CAKE.
-    function sweepRewardDust() external onlyRole(GUARDIAN_ROLE) nonReentrant returns (uint256) {
+    function sweepRewardDust() external pure returns (uint256) {
         revert InventorySweepDisabled();
     }
 
@@ -691,11 +733,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
     }
 
     function closeToInventory(bytes32 jobId, uint256 deadline, bool emergency) external nonReentrant {
-        if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
-        else _checkRole(KEEPER_ROLE, msg.sender);
-        // A halt must stop routine keeper activity. The guardian emergency branch
-        // and the B4-T2 recovery entrypoints stay open on purpose.
-        if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        _authorizeBoundedExit(emergency);
         Job storage job = MainV2Jobs.beginChunk(jobs, usedChunks, jobId, JobKind.CLOSE_TO_INVENTORY, 0);
         if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
 
@@ -727,6 +765,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         accountedPairedInventory = closeResult.nextAccountedPaired;
         accountedRewardInventory = closeResult.nextAccountedReward;
         _recordWithdrawalExecutionLoss(closeResult.expectedFairValue, closeResult.actualFairValue);
+        _clearRecoveryState();
 
         job.cumulativeInput = closeResult.expectedFairValue;
         job.cumulativeOutput = closeResult.actualFairValue;
@@ -784,6 +823,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.closeUnstakeAndCredit(
             address(venue), pairedToken, rewardToken, positionId, accountedPairedInventory, accountedRewardInventory
         );
+        _clearRecoveryState();
         emit VenueCloseStageRecovered(positionId, 1);
     }
 
@@ -799,13 +839,25 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         nonReentrant
     {
         uint256 positionId = activePositionId;
-        if (positionId == 0) revert NoActivePosition();
-        if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
+        // Freeze any queued Vault snapshot before the historical NFT changes
+        // from an excluded write-off into recognized Main inventory.
+        _commitWithdrawalCycleIfQueued();
+        // No recovery realization may leave Main open for a fresh LP cycle.
+        // A later revert rolls this transition back atomically.
+        if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
+        // With no active position, the first legacy minimum slot is interpreted
+        // as a protected historical token ID. The Venue mapping rejects zero,
+        // active, burned, or foreign IDs; its Main-derived oracle floors remain
+        // authoritative, so the otherwise-unused second legacy slot is ignored.
+        if (positionId == 0) {
+            (accountedPairedInventory, accountedRewardInventory) =
+                MainV2Inventory.realizeStrandedAndCredit(callerAmount0Min, deadline);
+            return;
+        }
         // A request can arrive after an empty-queue unstake and before this
         // realization step. Commit its Vault snapshot before any Venue preview
         // or decrease so it cannot be cancelled after manual close advances.
-        _commitWithdrawalCycleIfQueued();
-        (uint256 amount0Min, uint256 amount1Min) = MainV2Inventory.recoveryDecreaseMinimums(
+        RecoveryDecreasePlan memory plan = MainV2Inventory.recoveryDecreasePlan(
             venue,
             priceGuard,
             positionId,
@@ -815,20 +867,23 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
             emergencySpotOracleDeviationBps
         );
         // Calldata can tighten the execution condition, never relax it.
-        if (callerAmount0Min > amount0Min) amount0Min = callerAmount0Min;
-        if (callerAmount1Min > amount1Min) amount1Min = callerAmount1Min;
-        if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
+        if (callerAmount0Min > plan.amount0Min) plan.amount0Min = callerAmount0Min;
+        if (callerAmount1Min > plan.amount1Min) plan.amount1Min = callerAmount1Min;
         (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.closeDecreaseAndCredit(
             address(venue),
             pairedToken,
             rewardToken,
             positionId,
-            amount0Min,
-            amount1Min,
+            plan.amount0Min,
+            plan.amount1Min,
             deadline,
             accountedPairedInventory,
             accountedRewardInventory
         );
+        _recoveryExpectedFairValue = plan.expectedFairValue;
+        _recoveryReferenceUsdtPerWbnb = plan.referenceUsdtPerWbnb;
+        _recoveryRealizedFairValue = 0;
+        _recoveryLossJournalArmed = withdrawalCycleBatchCommitted;
         emit VenueCloseStageRecovered(positionId, 2);
     }
 
@@ -837,9 +892,19 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (positionId == 0) revert NoActivePosition();
         _commitWithdrawalCycleIfQueued();
         if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
-        (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.closeCollectAndCredit(
-            address(venue), pairedToken, rewardToken, positionId, accountedPairedInventory, accountedRewardInventory
+        RecoveryCollectResult memory collectResult = MainV2Inventory.closeCollectAndCredit(
+            address(venue),
+            asset,
+            pairedToken,
+            rewardToken,
+            positionId,
+            _recoveryReferenceUsdtPerWbnb,
+            accountedPairedInventory,
+            accountedRewardInventory
         );
+        accountedPairedInventory = collectResult.nextAccountedPaired;
+        accountedRewardInventory = collectResult.nextAccountedReward;
+        _recoveryRealizedFairValue += collectResult.realizedFairValue;
         emit VenueCloseStageRecovered(positionId, 3);
     }
 
@@ -851,26 +916,43 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         if (positionId == 0) revert NoActivePosition();
         _commitWithdrawalCycleIfQueued();
         if (mode == Mode.OPERATING) _setMode(Mode.CLOSED_TO_INVENTORY);
-        (accountedPairedInventory, accountedRewardInventory) = MainV2Inventory.closeBurnAndCredit(
-            address(venue), pairedToken, rewardToken, positionId, accountedPairedInventory, accountedRewardInventory
+        RecoveryCollectResult memory burnResult = MainV2Inventory.closeBurnAndCredit(
+            address(venue),
+            asset,
+            pairedToken,
+            rewardToken,
+            positionId,
+            _recoveryReferenceUsdtPerWbnb,
+            accountedPairedInventory,
+            accountedRewardInventory
         );
+        accountedPairedInventory = burnResult.nextAccountedPaired;
+        accountedRewardInventory = burnResult.nextAccountedReward;
+        _recoveryRealizedFairValue += burnResult.realizedFairValue;
+        if (_recoveryLossJournalArmed) {
+            _recordWithdrawalExecutionLoss(_recoveryExpectedFairValue, _recoveryRealizedFairValue);
+        }
+        _clearRecoveryState();
         activePositionId = 0;
         emit VenueCloseStageRecovered(positionId, 4);
     }
 
     /// @notice Abandon a position whose close cannot complete. The venue frees its
-    /// slot (returning the NFT to this contract if it was unstaked, or recording
-    /// it as stranded-in-masterchef otherwise); Main drops it from its books so
+    /// slot while retaining the NFT in the Venue's protected historical
+    /// registry (or recording it in Masterchef custody);
+    /// Main drops it from its books so
     /// `totalAssetsUsdt()` stops valuing it — a written-off position is not counted
-    /// as NAV, phantom or otherwise. Any LP value still trapped in a returned NFT
-    /// is deliberately excluded until an admin realizes it, never over-counted.
+    /// as NAV, phantom or otherwise. Any LP value in the protected NFT remains a
+    /// deliberate write-off until a guardian invokes the Main-accounted
+    /// historical realization path; Venue exposes no generic NFT egress/adoption.
     /// Forces HALTED: a write-off is a serious abnormal event and must require an
     /// explicit admin review (enableOperations) before trading resumes.
     function writeOffStrandedPosition() external onlyRole(GUARDIAN_ROLE) nonReentrant {
         uint256 positionId = activePositionId;
         if (positionId == 0) revert NoActivePosition();
-        // A write-off is irreversible; freeze the redeem batch first (B9-T2) so a
-        // queued request cannot be cancelled after the position is abandoned. The
+        // Abandoning the live book entry is irreversible within this step;
+        // freeze the redeem batch first (B9-T2) so a queued request cannot be
+        // cancelled after the position is abandoned. The
         // abandoned LP value is deliberately excluded from NAV and not measurable
         // here, so no discrete close-loss is recorded — see the report. No-op on an
         // empty queue.
@@ -880,10 +962,12 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         (stranded, accountedPairedInventory, accountedRewardInventory, pairedBefore) = MainV2Inventory.writeOffAndCredit(
             address(venue), pairedToken, rewardToken, accountedPairedInventory, accountedRewardInventory
         );
+        if (stranded != positionId) revert StrandedPositionMismatch(positionId, stranded);
+        _clearRecoveryState();
         activePositionId = 0;
         _setMode(Mode.HALTED);
-        bool inventoryReturned = pairedToken.balanceOf(address(this)) != pairedBefore;
-        emit VenuePositionWrittenOff(positionId, stranded, inventoryReturned);
+        bool pairedInventoryReturned = pairedToken.balanceOf(address(this)) != pairedBefore;
+        emit VenuePositionWrittenOff(positionId, stranded, pairedInventoryReturned);
     }
 
     /// @notice Direct-Pancake liquidation of paired-token inventory. `chunkIndex`
@@ -906,9 +990,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         bool finalChunk,
         bool emergency
     ) external nonReentrant returns (uint256 amountOut) {
-        if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
-        else _checkRole(KEEPER_ROLE, msg.sender);
-        if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        _authorizeBoundedExit(emergency);
         if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
         // Body in the linked MainV2Liquidation (EIP-170); it runs via delegatecall,
         // so token balances/approvals and the mapping pointers act on this
@@ -953,9 +1035,7 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         bool finalChunk,
         bool emergency
     ) external nonReentrant returns (uint256 amountOut) {
-        if (emergency) _checkRole(GUARDIAN_ROLE, msg.sender);
-        else _checkRole(KEEPER_ROLE, msg.sender);
-        if (!emergency && mode == Mode.HALTED) revert HaltedKeeperPath();
+        _authorizeBoundedExit(emergency);
         if (deadline < block.timestamp || deadline > block.timestamp + 600) revert InvalidDeadline();
         // Body in the linked MainV2Liquidation (EIP-170), same delegatecall
         // arrangement as liquidateAllWbnb.
@@ -1073,6 +1153,27 @@ contract DedicatedVaultMainV2 is AccessControl, ReentrancyGuard, ERC721Holder {
         Mode oldMode = mode;
         mode = newMode;
         emit ModeChanged(oldMode, newMode);
+    }
+
+    /// @dev HALTED still blocks every routine keeper action. Its guardian may
+    /// choose either the tight policy (`emergency=false`) or the explicitly
+    /// wider policy. Outside HALTED, the wider policy is unreachable.
+    function _authorizeBoundedExit(bool emergency) internal view {
+        if (emergency) {
+            _checkRole(GUARDIAN_ROLE, msg.sender);
+            if (mode != Mode.HALTED) revert EmergencyModeRequired();
+        } else if (mode == Mode.HALTED) {
+            if (!hasRole(GUARDIAN_ROLE, msg.sender)) revert HaltedKeeperPath();
+        } else {
+            _checkRole(KEEPER_ROLE, msg.sender);
+        }
+    }
+
+    function _clearRecoveryState() internal {
+        _recoveryExpectedFairValue = 0;
+        _recoveryReferenceUsdtPerWbnb = 0;
+        _recoveryRealizedFairValue = 0;
+        _recoveryLossJournalArmed = false;
     }
 
     /// @notice Auto-commit the queued batch when a keeper begins an inventory

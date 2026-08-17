@@ -1,7 +1,7 @@
 # Scope — Vault B V2 Audit 2 re-audit candidate
 
 Scope authority is `source/script/DeployVaultBV2.s.sol` from source commit
-`18c1beb5071605385ecc0276322d87e6c6ea5652`. Every contract it deploys is in
+`27e1e617296dde8c0dc1ff621eeec3a3b10b409d`. Every contract it deploys is in
 scope; the source snapshot includes the first-party Solidity dependencies
 needed to review that graph.
 
@@ -31,18 +31,20 @@ DedicatedVaultMainV2 -> BoundedPancakeExecutionAdapterV2 -> Router
                       -> VaultBPriceGuard / VaultBCakePriceGuard
 ```
 
-This context identifies interface assumptions only. Individual paid reviews
-are deliberately limited to exactly one flat file as specified in
-`BATCHES_AUDIT2.md`; do not make one reviewer audit another task's code.
+This context identifies interface assumptions only. Paid review boundaries
+are specified in `BATCHES_AUDIT2.md`. Two targets are intentionally combined
+only for the Strategy/FeeSink fee-flow review; other implementation text is
+context unless that task explicitly owns it.
 
 The Main flat includes all of its linked first-party `MainV2*` libraries,
 including `MainV2Open` and `MainV2Liquidation`. Those libraries are in scope
 within the single Main task.
 
 The Strategy flat also contains Main and `MainV2*` source text because the
-Strategy imports the concrete Main type. That text is type-resolution context,
-not Strategy runtime logic; it remains exclusively within the separate Main
-task.
+Strategy imports the concrete Main type. That text is type-resolution and
+reachability context, not a second Main line audit. The combined fee-flow task
+owns Strategy, `FixedFeeSink`, and `IFeeSink`; the separate Main task owns Main
+and its linked libraries.
 
 ## First-party dependencies included in `source/`
 
@@ -62,6 +64,8 @@ intentionally excluded.
 - HyperEVM/LiFi contracts and unrelated products.
 - Off-chain keeper/broadcaster software, deployment keys, production state,
   and any actual deployment.
+- `DeployVaultBV2BroadcastRehearsal.s.sol`, which is a local transaction-prefix
+  rehearsal harness and is not imported by the production deployment graph.
 
 The exclusions are not assertions of safety. They are absent to avoid paying
 for review of dead or unreachable code.

@@ -165,6 +165,17 @@ interface IVaultBExecutionAdapterV2 {
 interface IVaultBRewardPriceGuard {
     function DIRECT_ORACLE_FEE() external view returns (uint24);
 
+    /// @notice Un-haircut CAKE liquidation data for Main's bounded chunk
+    /// selection. This view neither reserves nor consumes emergency capacity.
+    /// `fairNotional` is the conservative lower source; `capNotional` is the
+    /// conservative upper source. `normalCapacity` is zero when the source
+    /// spread needs the wider emergency deviation band. `emergencyCapacity`
+    /// is the remaining active emergency allocation for an emergency request.
+    function liquidationSnapshot(uint256 amountIn, bool requestedEmergency)
+        external
+        view
+        returns (uint256 fairNotional, uint256 capNotional, uint256 normalCapacity, uint256 emergencyCapacity);
+
     function minimumOut(uint256 amountIn, bool emergency) external view returns (uint256 minOut);
 
     function minimumOutAndBudget(uint256 amountIn, bool emergency)
@@ -640,7 +651,7 @@ contract BoundedPancakeExecutionAdapterV2 is IVaultBExecutionAdapterV2 {
         if (main != address(0)) revert AlreadyBound();
         if (
             main_ == address(0) || main_ == address(this) || main_ == binder || main_ == address(priceGuard)
-                || main_.code.length == 0
+                || main_ == USDT || main_ == WBNB || main_ == PANCAKE_V3_SWAP_ROUTER || main_.code.length == 0
         ) revert InvalidMain();
         main = main_;
         emit MainBound(main_);

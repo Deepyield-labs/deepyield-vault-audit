@@ -3563,6 +3563,10 @@ interface IVaultBDirectWithdrawalCancellation {
     function cancelWithdrawalFromVault(bytes32 requestId) external returns (bool canceled);
 }
 
+interface IVaultBDirectForceSettlement {
+    function forceClearWithdrawalFromVault(bytes32 requestId) external returns (bool cleared);
+}
+
 /// @notice Stateless strategy checks and recovery dispatch kept outside Vault B's
 /// runtime bytecode. No library function writes Vault storage.
 library VaultBDepositLib {
@@ -3575,6 +3579,15 @@ library VaultBDepositLib {
             bool canceled = IVaultBDirectWithdrawalCancellation(assetSource).cancelWithdrawalFromVault(requestId);
             if (!canceled) revert StrategyWiringMismatch();
         }
+    }
+
+    /// @notice Canonical journal release after Vault has fixed a zero-asset
+    /// force payout. The immutable Main accepts it only from the configured
+    /// root Vault while that Vault exposes its force-settled flag. Failure must
+    /// revert the whole claim: local settlement may not outrun Main's journal.
+    function forceClearWithdrawal(address assetSource, bytes32 requestId) external {
+        bool cleared = IVaultBDirectForceSettlement(assetSource).forceClearWithdrawalFromVault(requestId);
+        if (!cleared) revert StrategyWiringMismatch();
     }
 
     function validateCandidate(IVaultBAsyncStrategy candidate, address expectedAsset, address expectedVault)
@@ -3618,7 +3631,13 @@ library VaultBDepositLib {
         uint256 depositCap,
         uint256 claimableAssets
     ) external view returns (uint256) {
-        if (blocked) return 0;
+        // A Vault without its first strategy has no attested deployment graph
+        // behind it. This is an unconditional admission gate: neither an
+        // admin cap update nor an unpause may make ERC-4626 deposit/mint live
+        // before strategy installation. Direct ERC-20 donations remain assets
+        // (and therefore keep the immediate bootstrap `VaultNotEmpty` gate
+        // closed), but they never create shares through this path.
+        if (blocked || address(strategy) == address(0)) return 0;
 
         uint256 deployedUpper;
         uint256 deployedLower;
@@ -5298,12 +5317,14 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     error RedeemCycleNotCommitted();
     error RedeemCycleAlreadySettled();
     error RedeemCycleTimeoutNotElapsed(uint256 nowTs, uint256 readyAt);
+    error RedeemCycleStrategyResponsive();
     error RedeemCycleNotReady(uint256 queuedShares, uint256 thresholdShares);
     error RedeemCycleExecutionLossExceeded(uint256 effectiveLoss, uint256 maximumLoss, uint256 requiredTopUp);
     error RedeemCyclePayoutUnderfunded(uint256 payoutBeforeCharge, uint256 executionLossCharge);
     error TooManyShares();
     error NothingClaimable();
     error StrategyAlreadySet();
+    error PendingStrategyActive(address strategy);
     error VaultNotEmpty();
     error NoPendingStrategy();
     error StrategyTimelockNotElapsed(uint64 readyAt);
@@ -5418,11 +5439,16 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     /// applyStrategy so the timelock protects the redirected allowance.
     function setStrategy(address newStrategy) external onlyRole(ADMIN_ROLE) {
         if (address(strategy) != address(0)) revert StrategyAlreadySet();
+        // A pending proposal pins a candidate and its asset source for the
+        // timelocked path. Letting an immediate bootstrap bypass it would leave
+        // a stale proposal that could later rotate the newly installed
+        // allowance. Explicitly cancel it or finish the governed path instead.
+        if (pendingStrategy != address(0)) revert PendingStrategyActive(pendingStrategy);
         // B11-T2: an immediate first activation grants an unlimited allowance, so it is
-        // only safe on a pristine vault. Deposits are allowed while the strategy is
-        // unset, so without this an admin could wait for deposits and then wire in an
-        // arbitrary contract with an unlimited allowance. Once shares or assets exist,
-        // the first strategy must go through the same timelock as a change
+        // only safe on a pristine vault. The ERC-4626 admission boundary quarantines
+        // new shares while the strategy is unset, but direct donations or historical
+        // funded state can still make the vault non-pristine. Once shares or assets
+        // exist, the first strategy must go through the same timelock as a change
         // (proposeStrategy -> applyStrategy), so holders can exit first. totalAssets()
         // reads only idle here (the strategy is unset, so it cannot revert).
         if (totalSupply() != 0 || totalAssets() != 0) revert VaultNotEmpty();
@@ -5792,27 +5818,34 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     }
 
     /// @notice B11-T3: recover a committed cycle whose readiness source is broken.
-    /// After REDEEM_CYCLE_TIMEOUT, ANYONE may settle the batch — calling the strategy
-    /// ZERO times, so a strategy that reverts on every call cannot keep the cycle (and
-    /// with it the whole vault, since a committed cycle blocks deposits and the sync
-    /// exit) locked forever. The payout is the batch's fair claim on the FROZEN commit
-    /// snapshot (`assetsSnapshot * committedShares / supplySnapshot`), capped at the
-    /// vault's available idle; any shortfall is borne pro-rata (each claim divides the
-    /// same payout by committed shares). Funds the venue returns AFTER this settlement
-    /// belong to the remaining holders — the payout is fixed here, not topped up.
-    /// Gated on the LOCAL commit flag, which is strategy-free and guarantees the
-    /// snapshot was frozen while the strategy was healthy.
+    /// After REDEEM_CYCLE_TIMEOUT, ANYONE may settle a batch only when the
+    /// strategy's commitment view is unavailable. A responsive strategy — even
+    /// if merely slow — remains on the normal path. The force payout uses only
+    /// known spendable idle, pro-rata to the batch's frozen share of supply, and
+    /// never spends a stale claim on capital whose current value cannot be read.
     function forceSettleStuckCycle() external nonReentrant {
         if (!_redeemCycleCommitted) revert RedeemCycleNotCommitted();
         if (redeemCycleSettlementInitialized) revert RedeemCycleAlreadySettled();
         uint256 readyAt = uint256(redeemCycleCommittedAt) + REDEEM_CYCLE_TIMEOUT;
         if (block.timestamp < readyAt) revert RedeemCycleTimeoutNotElapsed(block.timestamp, readyAt);
 
+        IVaultBAsyncStrategy activeStrategy = strategy;
+        if (address(activeStrategy) == address(0)) revert StrategyUnset();
+        // The force path is a recovery for an unavailable readiness source, not
+        // a caller-selected alternate price for a healthy-but-slow strategy.
+        bool strategyUnavailable;
+        try activeStrategy.withdrawalCycleCommitted() returns (bool) {}
+        catch {
+            strategyUnavailable = true;
+        }
+        if (!strategyUnavailable) revert RedeemCycleStrategyResponsive();
+
         uint256 batchShare =
             Math.mulDiv(redeemCycleAssetsSnapshot, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
         uint256 idle = IERC20(asset()).balanceOf(address(this));
         uint256 available = idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
-        uint256 payout = batchShare < available ? batchShare : available;
+        uint256 knownIdleShare = Math.mulDiv(available, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
+        uint256 payout = batchShare < knownIdleShare ? batchShare : knownIdleShare;
         redeemCyclePayoutAssets = payout;
         redeemCycleSettlementInitialized = true;
         redeemCycleForceSettled = true;
@@ -5871,8 +5904,9 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         if (request.status != RedeemStatus.PENDING) revert RedeemRequestUnknown();
         IVaultBAsyncStrategy activeStrategy = strategy;
         if (address(activeStrategy) == address(0)) revert StrategyUnset();
-        // B11-T3: a force-settled cycle pays from the frozen payout + idle, so it must
-        // not gate on (or otherwise touch) the broken readiness source.
+        // B11-T3: a force-settled cycle pays from the frozen payout + idle, so it
+        // bypasses the broken readiness gate. It releases the canonical zero-
+        // asset request below before clearing its local request state.
         if (!redeemCycleForceSettled && !activeStrategy.withdrawalReady(request.strategyRequestId)) {
             revert RedeemNotReady();
         }
@@ -5903,11 +5937,15 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // `<`, matching _ensureLiquidity: a strategy that returns 1 wei more than
         // requested (lot rounding) must not permanently jam this one claim and,
         // through it, the whole vault. Any surplus stays idle as shareholder value.
-        // B11-T3: skip the strategy pull on a force-settled cycle — the payout was
-        // capped at available idle, so `missing` is 0 and there is nothing to pull.
+        // A force payout is fully covered by known idle, so no user assets are
+        // pulled. Release Main's canonical zero-asset handle directly through
+        // its immutable root-Vault endpoint; this does not rely on the adapter
+        // being callable and keeps the two commitment journals aligned.
         if (!redeemCycleForceSettled) {
             uint256 withdrawn = activeStrategy.claimWithdrawal(request.strategyRequestId, missing);
             if (withdrawn < missing) revert StrategyShortfall(missing, withdrawn);
+        } else {
+            VaultBDepositLib.forceClearWithdrawal(strategyAssetSource, request.strategyRequestId);
         }
         uint256 spendableIdle = _spendableIdle();
         if (spendableIdle < assets) {
@@ -5952,6 +5990,9 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         if (request.status != RedeemStatus.PENDING || msg.sender != request.owner) {
             revert RedeemRequestUnknown();
         }
+        // Mutable while freely cancellable; fixed before the committed payout is
+        // observable so the owner cannot redirect a batch claim mid-settlement.
+        if (_redeemCycleCommitted || redeemCycleSettlementInitialized) revert RedeemCycleLocked();
         address oldReceiver = request.receiver;
         if (newReceiver == oldReceiver) return;
         // B11-T4: the pending-slot guard is keyed by (owner, receiver), so moving the
@@ -6132,7 +6173,11 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
 
         uint256 basePayout = Math.mulDiv(currentAssets, batchShares, supply);
         uint256 charge = Math.mulDiv(charged, supply - batchShares, supply, Math.Rounding.Ceil);
-        if (charge > basePayout) return (false, 0);
+        // A full queue is deliberately an independent liveness trigger. A small
+        // committed batch can bear at most its pro-rata current-asset claim, so
+        // saturate an excessive additional loss charge at zero payout instead
+        // of making every request unclaimable forever.
+        if (charge >= basePayout) return (true, 0);
         return (true, basePayout - charge);
     }
 

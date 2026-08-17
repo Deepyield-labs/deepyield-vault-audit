@@ -1,15 +1,15 @@
 # Audit 2 — Batch 04 upload queue
 
-This directory contains **four separate paid tasks**, not one combined audit.
-Upload one flat per request; do not add another task's contract as a required
-review target.
+These four flats are packaged for later separately authorized tasks; none is
+part of the initial three-review tranche. If commissioned, upload one flat per
+request and keep the other implementations as canonical reachability context.
 
-| Task | File | Scope and residual handoff |
+| Technical unit | File | Scope and residual handoff |
 |---:|---|---|
-| 6 | `VaultBPriceGuard.audit2.flat.sol` | WBNB oracle/TWAP integrity, deviations, normal/emergency loss budgets, caps, and configuration. See `../../EXTERNAL_REVIEW_INPUTS_AUDIT2.md`. Executor/Main policy is out of scope. |
-| 7 | `BoundedPancakeExecutionAdapterV2.audit2.flat.sol` | WBNB swap binding, approvals/input accounting, minimums/deadlines, and observed output/router mismatch handling. Guard/Main policy is out of scope. |
-| 8 | `VaultBCakePriceGuard.audit2.flat.sol` | CAKE source integrity, decimal handling, divergence, active-window consumed-notional retention, emergency budgets, caps, and configuration. Reward adapter/Main policy is out of scope. |
-| 9 | `BoundedPancakeRewardAdapterV2.audit2.flat.sol` | CAKE swap binding, approvals/input accounting, minimums/deadlines, observed output/router mismatch handling, and emergency-budget consumption only after settlement/output checks. Guard/Main policy is out of scope. |
+| 6 | `VaultBPriceGuard.audit2.flat.sol` | WBNB oracle/TWAP integrity, deviation, normal/emergency capacity, conservative UPPER notional, feed failure and immutable configuration. See `../../EXTERNAL_REVIEW_INPUTS_AUDIT2.md`. |
+| 7 | `BoundedPancakeExecutionAdapterV2.audit2.flat.sol` | One-shot Main binding, approvals/input accounting, minimums/deadlines, observed output/router mismatch, and final-debit rollback. |
+| 8 | `VaultBCakePriceGuard.audit2.flat.sol` | Direct/cross-pool plus independent CAKE/USD reference integrity, decimal/freshness handling, divergence, LOWER fair value, UPPER cap notional, snapshot capacity, and emergency budget policy. |
+| 9 | `BoundedPancakeRewardAdapterV2.audit2.flat.sol` | One-shot Main binding, approvals/input accounting, minimums/deadlines, observed output/router mismatch, and emergency-budget consumption only after settlement/output checks. |
 
 A Main/guards/adapters integration review, if wanted after these four
 independent reviews, must be separately funded and scoped.

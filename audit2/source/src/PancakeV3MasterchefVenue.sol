@@ -240,6 +240,7 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
     event PositionCollectionRerouted(uint256 indexed tokenId, address indexed recipient);
     event PositionCollectionDeferred(uint256 indexed tokenId, uint8 failedMask);
     event HarvestDegraded(uint256 indexed tokenId, uint8 failedMask);
+    event StrandedPositionRealized(uint256 indexed tokenId);
 
     modifier onlyController() {
         if (msg.sender != controller) revert OnlyController();
@@ -468,7 +469,8 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
 
     /// @notice Recover an unrelated ERC20 accidentally sent to this Venue.
     /// Managed asset/paired/reward balances are never allowed to take an
-    /// arbitrary-recipient path; use `sweepManagedTokensToController` for those.
+    /// arbitrary-recipient path; only Main-mediated accounting paths may move
+    /// those balances.
     function rescueERC20(IERC20 token, address recipient) external onlyControllerGovernance returns (uint256 amount) {
         if (recipient == address(0)) revert InvalidRecipient();
         address tokenAddress = address(token);
@@ -493,34 +495,98 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
         emit ERC721Rescued(address(token), tokenId, recipient);
     }
 
-    /// @notice Recover a written-off NFT that remains in Masterchef custody once
-    /// Masterchef service returns. Only the original depositor (this Venue) can
-    /// call its withdraw API, so governance needs this narrow forwarding path.
-    /// The NFT remains protected in Venue custody. Existing Main V1/V2 cannot
-    /// realize or eject an NFT, so this Venue-only patch deliberately exposes no
-    /// protected-NFT transfer path to a controller or arbitrary recipient.
-    function recoverStrandedPositionFromMasterchef(uint256 tokenId) external onlyControllerGovernance {
+    /// @notice Controller-only custody step retained for interface compatibility.
+    /// Canonical Main deliberately exposes no unaccounted forwarding entrypoint;
+    /// its guardian uses the atomic realization path below instead.
+    function recoverStrandedPositionFromMasterchef(uint256 tokenId) external onlyController {
+        _recoverProtectedPositionFromMasterchef(tokenId);
+    }
+
+    /// @notice Controller-only compatibility surface. With canonical Main this
+    /// can be reached only from code that wraps the call in balance snapshots;
+    /// root governance can no longer bypass Main's inventory accounting.
+    function sweepManagedTokensToController() external onlyController {
+        _returnAllToController();
+        emit ManagedTokensSwept(controller);
+    }
+
+    /// @notice Preview full-liquidity geometry for a protected historical NFT.
+    /// Main owns the oracle policy; this is only the same raw V3 simulation as
+    /// `previewCloseAmounts`, available because the NFT is not active anymore.
+    function previewStrandedCloseAmounts(uint256 tokenId)
+        external
+        view
+        returns (uint256 assetExpected, uint256 pairedExpected)
+    {
+        if (tokenId == activeTokenId || !protectedStrandedTokenIds[tokenId]) {
+            revert PositionTokenProtected(tokenId);
+        }
+        (,,,,, int24 tl, int24 tu, uint128 liq,,,,) = nfpm.positions(tokenId);
+        (uint160 sqrtP,,,,,,) = pool.slot0();
+        return V3PositionValuer.amounts(sqrtP, tl, tu, liq);
+    }
+
+    /// @notice Realize one protected NFT only to the current authenticated
+    /// controller. This cannot be called by governance directly: Main snapshots
+    /// and credits every returned fungible balance delta around this call.
+    function realizeStrandedPosition(uint256 tokenId, uint256 amount0Min, uint256 amount1Min, uint256 deadline)
+        external
+        onlyController
+    {
+        if (tokenId == activeTokenId || !protectedStrandedTokenIds[tokenId]) {
+            revert PositionTokenProtected(tokenId);
+        }
+        _requireDeadline(deadline);
+
+        if (protectedStrandedWasStaked[tokenId]) {
+            // This entire call is wrapped by Main's balance snapshot, so either
+            // direct-to-controller or Venue-fallback reward delivery is credited.
+            _tryHarvestReward(tokenId);
+            _recoverProtectedPositionFromMasterchef(tokenId);
+        } else {
+            _requireNfpmOwner(tokenId, address(this));
+        }
+
+        (,,,,,,, uint128 liq,,,,) = nfpm.positions(tokenId);
+        if (liq > 0) {
+            nfpm.decreaseLiquidity(
+                INfpmVenue.DecreaseLiquidityParams({
+                    tokenId: tokenId, liquidity: liq, amount0Min: amount0Min, amount1Min: amount1Min, deadline: deadline
+                })
+            );
+        }
+        // Strict controller delivery is intentional: this call runs inside
+        // Main's balance snapshot, so a blocklisted recipient must roll back
+        // rather than burn/eject value into an unaccounted Venue balance.
+        nfpm.collect(
+            INfpmVenue.CollectParams({
+                tokenId: tokenId, recipient: controller, amount0Max: type(uint128).max, amount1Max: type(uint128).max
+            })
+        );
+        // MasterChef may pay reward to Venue during withdraw. Any such reward,
+        // plus pre-existing managed balances, is transferred strictly inside
+        // Main's accounting snapshot. Failure rolls back NFT realization.
+        _returnAllToController();
+        nfpm.burn(tokenId);
+        delete protectedStrandedTokenIds[tokenId];
+        delete protectedStrandedWasStaked[tokenId];
+        if (tokenId == strandedTokenId) {
+            strandedTokenId = 0;
+            strandedWasStaked = false;
+        }
+        emit StrandedPositionRealized(tokenId);
+    }
+
+    function _recoverProtectedPositionFromMasterchef(uint256 tokenId) private {
         if (
             !farmed || tokenId == activeTokenId || !protectedStrandedTokenIds[tokenId]
                 || !protectedStrandedWasStaked[tokenId]
         ) revert PositionTokenProtected(tokenId);
-        // Reward realization is best-effort; the subsequent withdraw remains the
-        // authoritative recovery step and may still revert if Masterchef itself
-        // cannot release the NFT.
-        _tryHarvestReward(tokenId);
         masterchef.withdraw(tokenId, address(this));
         _requireNfpmOwner(tokenId, address(this));
         protectedStrandedWasStaked[tokenId] = false;
         if (tokenId == strandedTokenId) strandedWasStaked = false;
-        _tryReturnAllToController();
         emit StrandedPositionNFTReturnedToVenue(tokenId);
-    }
-
-    /// @notice Recover idle managed balances without changing their trust
-    /// boundary: the recipient is always the one current controller.
-    function sweepManagedTokensToController() external onlyControllerGovernance {
-        _tryReturnAllToController();
-        emit ManagedTokensSwept(controller);
     }
 
     function _requireDeadline(uint256 deadline) private view {
@@ -646,10 +712,11 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
 
     /// @notice Deliberately abandon a position whose close cannot complete, so one
     /// stuck NFT cannot block the venue from ever opening again. The NFT is NOT
-    /// discarded: if it is already back at the Venue it stays here under permanent
-    /// protected-id tracking, and if it is still staked in a broken Masterchef
-    /// (where `withdraw` reverts) it stays there until the narrow recovery path can
-    /// withdraw it. Either way the id is retained in `strandedTokenId` and surfaced
+    /// discarded: if it is already back at the Venue it stays here under
+    /// protected-id tracking until an accounted realization. If it is still staked
+    /// in a broken Masterchef (where `withdraw` reverts), it stays there until the
+    /// narrow recovery path can withdraw it. Either way the id is retained in
+    /// `strandedTokenId` and surfaced
     /// via `PositionStranded`, and the Venue is freed. Controller-only; the controller
     /// enforces the narrower guardian gate for this most dangerous primitive.
     function writeOffStrandedPosition() external onlyController returns (uint256 strandedId) {
@@ -732,12 +799,13 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
     }
 
     function _collectStage(uint256 positionId) internal returns (uint8 failedMask) {
-        // Collect independently per token leg. A frozen USDT leg must not roll
-        // back recoverable WBNB (or vice versa). Each leg first targets Main to
-        // bypass a blacklisted Venue, then falls back to Venue so a
-        // controller-specific block still commits the NFPM collection.
-        (bool assetCollected,,) = _tryCollectNfpmLeg(positionId, type(uint128).max, 0, asset);
-        (bool pairedCollected,,) = _tryCollectNfpmLeg(positionId, 0, type(uint128).max, paired);
+        // Collect independently per token leg. A blocked Main must leave that
+        // leg owed by the NFT rather than park it at Venue: final burn is strict
+        // specifically so Main cannot clear its accounting around an
+        // undelivered balance. The unaffected leg can still be collected and is
+        // credited by Main's staged-recovery snapshot.
+        bool assetCollected = _tryCollectNfpmLegToController(positionId, type(uint128).max, 0);
+        bool pairedCollected = _tryCollectNfpmLegToController(positionId, 0, type(uint128).max);
         if (!assetCollected) failedMask |= 1;
         if (!pairedCollected) failedMask |= 2;
 
@@ -749,7 +817,23 @@ contract PancakeV3MasterchefVenue is IDedicatedVenueV2, ERC721Holder {
             // an already-collected leg safely returns zero on the retry.
             emit PositionCollectionDeferred(positionId, failedMask);
         }
-        _tryReturnAllToController();
+    }
+
+    function _tryCollectNfpmLegToController(uint256 positionId, uint128 amount0Max, uint128 amount1Max)
+        private
+        returns (bool collected)
+    {
+        try nfpm.collect(
+            INfpmVenue.CollectParams({
+                tokenId: positionId, recipient: controller, amount0Max: amount0Max, amount1Max: amount1Max
+            })
+        ) returns (
+            uint256, uint256
+        ) {
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     function _burnStage(uint256 positionId) internal {

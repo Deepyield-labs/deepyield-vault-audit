@@ -59,6 +59,17 @@ interface IVaultBExecutionAdapterV2 {
 interface IVaultBRewardPriceGuard {
     function DIRECT_ORACLE_FEE() external view returns (uint24);
 
+    /// @notice Un-haircut CAKE liquidation data for Main's bounded chunk
+    /// selection. This view neither reserves nor consumes emergency capacity.
+    /// `fairNotional` is the conservative lower source; `capNotional` is the
+    /// conservative upper source. `normalCapacity` is zero when the source
+    /// spread needs the wider emergency deviation band. `emergencyCapacity`
+    /// is the remaining active emergency allocation for an emergency request.
+    function liquidationSnapshot(uint256 amountIn, bool requestedEmergency)
+        external
+        view
+        returns (uint256 fairNotional, uint256 capNotional, uint256 normalCapacity, uint256 emergencyCapacity);
+
     function minimumOut(uint256 amountIn, bool emergency) external view returns (uint256 minOut);
 
     function minimumOutAndBudget(uint256 amountIn, bool emergency)

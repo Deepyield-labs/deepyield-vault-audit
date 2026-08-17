@@ -1,14 +1,15 @@
 # Audit 2 — Batch 03: Pancake Venue
 
-Upload only `flat/PancakeV3MasterchefVenue.audit2.flat.sol` as one paid task.
+This flat is packaged for a later separately authorized task; it is not one of
+the initial three requests.
 
 Review Pancake V3 NFT custody, MasterChef failure handling, staged close and
 harvest recovery, recipient degradation, controller rotation/timelock,
 managed-token rescue exclusions, callbacks, minima/deadlines, and
 stranded/write-off custody.
 
-The Main/Venue accounting and HALTED-mode edge requires a separately scoped
-integration review if desired. For this task, Main policy is an external
-interface assumption. Retain the residual that write-off is economically
-irreversible for NFT-held value and that simultaneous external recipient
-failure needs external recovery.
+Review protected historical-position realization, strict controller delivery,
+fallback-collect liveness, one-live-position invariants, and controller
+governance identity in addition to the lifecycle above. Main inventory/NAV
+crediting is canonical context; graph-wide accounting remains a separately
+scoped integration question.

@@ -68,7 +68,10 @@ contract BoundedPancakeRewardAdapterV2 is IVaultBRewardExecutionAdapterV2 {
         // cheaper and safer to redeploy than to add runtime Main rotation.
         if (msg.sender != binder) revert NotBinder();
         if (main != address(0)) revert AlreadyBound();
-        if (main_ == address(0) || main_ == address(this) || main_.code.length == 0) revert InvalidMain();
+        if (
+            main_ == address(0) || main_ == address(this) || main_ == binder || main_ == address(priceGuard)
+                || main_ == rewardToken || main_ == asset || main_ == PANCAKE_V3_SWAP_ROUTER || main_.code.length == 0
+        ) revert InvalidMain();
         main = main_;
         emit MainBound(main_);
     }

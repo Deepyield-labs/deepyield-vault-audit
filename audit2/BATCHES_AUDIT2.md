@@ -1,30 +1,38 @@
-# Audit 2 — one-file paid review plan
+# Audit 2 — three-review initial plan
 
-Every `.audit2.flat.sol` file below is one paid external task. A batch is an
-upload location only, not a combined scope. Each task must state: **Audit ONLY
-the linked flat file. Do not treat another paid task's contract as in-scope.**
+The package contains nine deterministic flat units, but the currently
+requested external tranche is exactly three paid reviews. No request is
+submitted or authorized by this package.
 
-| Paid-task order | Upload location | Flat file | Narrow review boundary |
-|---:|---|---|---|
-| 1 | Batch 01 | `DeepYieldVaultB` | ERC-4626 accounting; async queue, cancellation, claims, claimable-reserve isolation, liabilities, and Strategy-boundary assumptions |
-| 2 | Batch 01 | `FixedFeeSink` | forwarding, treasury timelock, balance deltas, and recipient failures |
-| 3 | Batch 01 | `DedicatedVaultStrategyAdapterV2` | Vault/Main bridge, fee basis, deferred or under-pulled fee remittance, callbacks, ordering, and transfer deltas |
-| 4 | Batch 02 | `DedicatedVaultMainV2` | Main lifecycle, recovery, inventory, liquidation, withdrawal readiness, and its linked first-party libraries |
-| 5 | Batch 03 | `PancakeV3MasterchefVenue` | NFT/MasterChef lifecycle, staged close/harvest, rescue, rotation, and write-off boundaries |
-| 6 | Batch 04 | `VaultBPriceGuard` | WBNB oracle/TWAP policy, deviations, loss budgets, and caps |
-| 7 | Batch 04 | `BoundedPancakeExecutionAdapterV2` | WBNB execution binding, approvals, minimums/deadlines, and observed output |
-| 8 | Batch 04 | `VaultBCakePriceGuard` | CAKE source/decimal/divergence, active-window consumed-notional retention, and emergency budget policy |
-| 9 | Batch 04 | `BoundedPancakeRewardAdapterV2` | CAKE execution binding, approvals, minimums/deadlines, observed output, and post-settlement emergency-budget debit ordering |
+| Paid task | Upload inputs | Review boundary |
+|---:|---|---|
+| 1 | Batch 01: `DeepYieldVaultB.audit2.flat.sol` | Vault-only ERC-4626 accounting, strategyless admission gate, strategy timelock/bootstrap, paused exits, async queue, cancellation, claims, reserves, liabilities, and insolvency |
+| 2 | Batch 01: `DedicatedVaultStrategyAdapterV2.audit2.flat.sol`, `FixedFeeSink.audit2.flat.sol`, plus raw `IFeeSink.sol` | One combined fee-flow unit: high-water basis, realized loss and recovery, sync/async withdrawals, fee crystallization, deferred `unremittedFee`, retry, exact deltas, treasury rotation, and failure atomicity |
+| 3 | Batch 02: `DedicatedVaultMainV2.audit2.flat.sol` | Main lifecycle and its linked `MainV2*` libraries: funding, open/close/recovery, inventory, readiness, jobs, liquidation, emergency capacity, and rollback |
 
-Scope is the named deployable plus first-party library logic linked, inlined,
-or transitively compiled into its runtime. Another deployable, and dependency
-code pulled in solely through it, is context and out of scope when it appears
-only for type resolution. In particular, the Strategy flat contains Main and
-`MainV2*` implementation context because it imports the concrete Main type;
-that context belongs exclusively to task 4. The Main task owns its linked
-first-party libraries, but does not require review of the separate Venue,
-guard, adapter, Vault, or Strategy implementation.
+Do not submit `FixedFeeSink` alone for a third time. Its meaningful security
+boundary is the combined Strategy/FeeSink flow in task 2.
 
-If a cross-contract assessment is required after the nine reviews, commission
-it as a separate tenth task with its own funded scope and links. Do not impose
-that assessment as a condition of any individual task.
+Historical reports are hypotheses, not accepted facts or fixes. Reachability
+must be re-derived against this exact candidate and its canonical graph. In
+particular, use the real `FixedFeeSink`, Main, guards, adapters, and immutable
+identity wiring as evidence; do not establish a finding only by replacing a
+pinned component with a hypothetical malicious implementation. Explicit
+trusted-admin misconfiguration should be classified separately from an
+unprivileged exploit.
+
+Every finding should include exact flat and raw-source locations, concrete
+preconditions, a local unit-test or failure trace, severity rationale, and
+minimal remediation. This is authorized defensive, pre-deployment review;
+there is no live-system interaction in scope.
+
+## Packaged but not in the initial three requests
+
+The following five flat units remain available for later separately
+authorized review: `PancakeV3MasterchefVenue`, `VaultBPriceGuard`,
+`BoundedPancakeExecutionAdapterV2`, `VaultBCakePriceGuard`, and
+`BoundedPancakeRewardAdapterV2`. Packaging them does not create an audit order.
+
+A graph-wide integration assessment, if commissioned later, is a distinct
+funded task. It should reconcile component reports rather than silently expand
+one of the three scopes above.
