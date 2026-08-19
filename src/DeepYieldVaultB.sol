@@ -69,11 +69,16 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     uint256 public nextRequestId;
     uint256 public outstandingRedeemShares;
     uint256 public outstandingRedeemCount;
-    /// @notice Supply snapshot taken when the redeem queue OPENS (B10-T1 finding 8).
-    /// The commit threshold is 5% of THIS, not of live supply, so a caller cannot
-    /// inflate supply just before commit to defer it, nor deposit-then-queue to force
-    /// an early commit at ~5% of the pre-attack supply. Zero while the queue is empty.
+    /// @notice Supply snapshot taken when the redeem queue OPENS. It is retained
+    /// as a floor against same-block dilution; commitThresholdShares also tracks
+    /// later live-supply growth. Zero while the queue is empty.
     uint256 public redeemCycleThresholdBase;
+    /// @notice F3 (Audit 2 delta): the pending-redeem ceiling frozen at queue-open, so
+    /// the two full-queue COMMIT triggers key off the cap that was in force when the
+    /// queue opened — an admin cannot retune `maxPendingRedeems` mid-queue to force an
+    /// early commit of a live batch. Zero while the queue is empty. Mirrors
+    /// {redeemCycleThresholdBase}.
+    uint256 public redeemCycleMaxPendingAtOpen;
     uint256 public redeemCycleSupplySnapshot;
     uint256 public redeemCycleAssetsSnapshot;
     uint256 public redeemCycleCommittedShares;
@@ -135,15 +140,20 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     error NotRedeemOwner();
     error NotTreasury();
     error RedeemCycleLocked();
+    /// @notice F6 (Audit 2 delta): the auto-commit trampoline is callable only by the
+    /// contract itself.
+    error OnlySelf();
     error RedeemCycleNotCommitted();
     error RedeemCycleAlreadySettled();
     error RedeemCycleTimeoutNotElapsed(uint256 nowTs, uint256 readyAt);
+    error RedeemCycleStrategyResponsive();
     error RedeemCycleNotReady(uint256 queuedShares, uint256 thresholdShares);
     error RedeemCycleExecutionLossExceeded(uint256 effectiveLoss, uint256 maximumLoss, uint256 requiredTopUp);
     error RedeemCyclePayoutUnderfunded(uint256 payoutBeforeCharge, uint256 executionLossCharge);
     error TooManyShares();
     error NothingClaimable();
     error StrategyAlreadySet();
+    error PendingStrategyActive(address strategy);
     error VaultNotEmpty();
     error NoPendingStrategy();
     error StrategyTimelockNotElapsed(uint64 readyAt);
@@ -171,6 +181,17 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     event RedeemCycleForceSettled(uint256 payout, uint256 batchShare, uint256 available);
     event RedeemClaimed(uint256 indexed requestId, address indexed receiver, uint256 shares, uint256 assets);
     event RedeemReceiverUpdated(uint256 indexed requestId, address indexed oldReceiver, address indexed newReceiver);
+    /// @notice F4 (Audit 2 delta): a force-settled claim paid the receiver from idle but
+    /// could not release the canonical strategy/Main handle (all fallback tiers failed).
+    /// The handle is orphaned pending {releaseDeferredRedeemHandle}.
+    event RedeemHandleReleaseDeferred(uint256 indexed requestId, bytes32 indexed strategyRequestId);
+    /// @notice F4 (Audit 2 delta): an orphaned redeem handle was released by the admin
+    /// escape hatch after the strategy/Main endpoint recovered.
+    event RedeemHandleReleased(bytes32 indexed strategyRequestId);
+    /// @notice F6 (Audit 2 delta): a full-queue-triggering request could not auto-commit
+    /// because the strategy's one-way commit reverted; the request is still queued and the
+    /// cycle stays committable via the permissionless path.
+    event RedeemCycleAutoCommitDeferred(uint256 outstandingRedeemCount);
     event RedeemCanceled(uint256 indexed requestId, address indexed owner, uint256 shares);
     event RedeemEscrowed(address indexed receiver, uint256 assets);
     event ClaimableWithdrawn(address indexed owner, address indexed to, uint256 assets);
@@ -258,11 +279,16 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     /// applyStrategy so the timelock protects the redirected allowance.
     function setStrategy(address newStrategy) external onlyRole(ADMIN_ROLE) {
         if (address(strategy) != address(0)) revert StrategyAlreadySet();
+        // A pending proposal pins a candidate and its asset source for the
+        // timelocked path. Letting an immediate bootstrap bypass it would leave
+        // a stale proposal that could later rotate the newly installed
+        // allowance. Explicitly cancel it or finish the governed path instead.
+        if (pendingStrategy != address(0)) revert PendingStrategyActive(pendingStrategy);
         // B11-T2: an immediate first activation grants an unlimited allowance, so it is
-        // only safe on a pristine vault. Deposits are allowed while the strategy is
-        // unset, so without this an admin could wait for deposits and then wire in an
-        // arbitrary contract with an unlimited allowance. Once shares or assets exist,
-        // the first strategy must go through the same timelock as a change
+        // only safe on a pristine vault. The ERC-4626 admission boundary quarantines
+        // new shares while the strategy is unset, but direct donations or historical
+        // funded state can still make the vault non-pristine. Once shares or assets
+        // exist, the first strategy must go through the same timelock as a change
         // (proposeStrategy -> applyStrategy), so holders can exit first. totalAssets()
         // reads only idle here (the strategy is unset, so it cannot revert).
         if (totalSupply() != 0 || totalAssets() != 0) revert VaultNotEmpty();
@@ -337,9 +363,27 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     /// and must stay >= 1 so the queue is never bricked to zero.
     function setMaxPendingRedeems(uint256 newMax) external onlyRole(ADMIN_ROLE) {
         if (newMax == 0 || newMax > MAX_PENDING_REDEEMS_CEILING) revert InvalidMaxPendingRedeems(newMax);
+        // F3 (Audit 2 delta): while a queue is open, refuse to drop the ceiling below the
+        // live queue depth. The commit triggers already read the frozen open-time cap, so
+        // this only closes the residual admission-side griefing (locking new entrants out
+        // of an in-flight queue) and keeps the live cap coherent with the frozen one.
+        if (outstandingRedeemCount > 0 && newMax < outstandingRedeemCount) {
+            revert InvalidMaxPendingRedeems(newMax);
+        }
         uint256 old = maxPendingRedeems;
         maxPendingRedeems = newMax;
         emit MaxPendingRedeemsUpdated(old, newMax);
+    }
+
+    /// @notice F4 (Audit 2 delta): admin escape hatch to release a canonical redeem
+    /// handle that a force-settled claim could not release (logged via
+    /// {RedeemHandleReleaseDeferred}) because the strategy and Main endpoints were both
+    /// unavailable at claim time. Retried through the strict (revert-on-failure) path, so
+    /// it only succeeds once an endpoint can actually clear the handle — the receiver was
+    /// already paid from idle, so this only reconciles the canonical journal.
+    function releaseDeferredRedeemHandle(bytes32 strategyRequestId) external onlyRole(ADMIN_ROLE) {
+        VaultBDepositLib.cancelWithdrawal(strategy, strategyAssetSource, strategyRequestId);
+        emit RedeemHandleReleased(strategyRequestId);
     }
 
     function pause() external onlyRole(GUARDIAN_ROLE) {
@@ -374,7 +418,11 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
             address(this),
             strategy,
             strategyAssetSource,
-            paused() || _redeemCycleCommitted || pendingStrategy != address(0),
+            // F8 (Audit 2 delta): combined committed view, matching the state-changing
+            // deposit/mint guards, so reported capacity is not falsely nonzero during the
+            // Main-auto-commit lazy-snapshot window. maxDeposit()'s try/catch maps a
+            // strategy-outage revert here to 0, consistent with deposit reverting then too.
+            paused() || redeemCycleCommitted() || pendingStrategy != address(0),
             totalSupply(),
             depositCap,
             totalClaimableAssets
@@ -392,7 +440,7 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     }
 
     function availableImmediateLiquidity() public view returns (uint256) {
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 idle = _spendableIdle();
         if (address(strategy) == address(0)) return idle;
         // P1-T1: the strategy is external; a revert here must not brick the four
         // ERC-4626 max* views. On failure, degrade to the immediately-idle balance
@@ -550,6 +598,8 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         if (outstandingRedeemCount == 0) {
             // Fix the commit-threshold base at queue-open (B10-T1 finding 8).
             redeemCycleThresholdBase = totalSupply();
+            // F3 (Audit 2 delta): freeze the full-queue commit ceiling at open too.
+            redeemCycleMaxPendingAtOpen = maxPendingRedeems;
             emit RedeemCycleOpened(redeemCycleThresholdBase);
         }
 
@@ -572,12 +622,22 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         activeStrategy.requestWithdrawal(strategyId, 0);
         emit RedeemRequested(requestId, strategyId, owner, receiver, shares);
 
-        // Reaching the configured queue ceiling is an irreversible commit trigger
-        // in this same transaction. There is no intermediate full-but-cancelable
-        // state: either registration + snapshot + Main commit all succeed, or the
-        // final request rolls back and the queue remains below capacity.
-        if (outstandingRedeemCount == maxPendingRedeems) {
-            _commitRedeemCycle(activeStrategy, commitThresholdShares());
+        // Reaching the configured queue ceiling is an atomic liveness trigger in
+        // this same transaction. A sub-economic queue is settled from known idle;
+        // an economic queue commits Main. Either way the final request cannot
+        // leave a full, unserviceable queue behind.
+        if (outstandingRedeemCount == redeemCycleMaxPendingAtOpen) {
+            // F6 (Audit 2 delta): best-effort auto-commit. The economic branch makes a
+            // one-way-door strategy.commitWithdrawalCycle() call; a revert there must not
+            // unwind the marginal request's escrow and slot. Attempt it through a self-call
+            // so a failure rolls back only the commit (snapshot included) and leaves the
+            // queue full-but-uncommitted, committable later via the permissionless
+            // commitRedeemCycle() once the strategy recovers. The sub-economic branch makes
+            // no strategy call and so always commits synchronously here.
+            try this.autoCommitOnFullQueue(activeStrategy) {}
+            catch {
+                emit RedeemCycleAutoCommitDeferred(outstandingRedeemCount);
+            }
         }
     }
 
@@ -601,14 +661,10 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         }
 
         uint256 threshold = commitThresholdShares();
-        // B11-T4: a full queue is a second, independent commit trigger, OR-ed with the
-        // 5% threshold. Sybil dust that never reaches 5% could otherwise pin the queue at
-        // capacity and block every honest exit forever. Committing a full queue burns
-        // those shares at the cycle price — the filler gets exactly the exit it queued, so
-        // it is not a denial of service, and repeating it costs another full queue of real,
-        // exiting shares. The threshold base snapshot (finding 8) is untouched: this only
-        // adds a trigger, it does not change how `threshold` is computed.
-        bool queueFull = outstandingRedeemCount >= maxPendingRedeems;
+        // A full queue is a second, independent liveness trigger. Sub-economic
+        // dust is paid only from known idle; otherwise the normal strategy commit
+        // path is used. This keeps final-slot atomicity without a cheap unwind.
+        bool queueFull = outstandingRedeemCount >= redeemCycleMaxPendingAtOpen;
         if (outstandingRedeemShares < threshold && !queueFull) {
             revert RedeemCycleNotReady(outstandingRedeemShares, threshold);
         }
@@ -628,35 +684,89 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
 
     function _commitRedeemCycle(IVaultBAsyncStrategy activeStrategy, uint256 threshold) internal {
         _takeRedeemCycleSnapshot(threshold);
+        // F2 (Audit 2 delta): route economic-vs-sub-economic on the QUEUE-OPEN frozen
+        // base, not the growth-tracked live threshold. `commitThresholdShares()` mixes in
+        // live `totalSupply()` (deliberately, for B10-F8's readiness gate), which a same-
+        // transaction deposit can inflate — pumping the live threshold above an honest,
+        // genuinely-large batch to misroute it into the idle-only settlement and skip the
+        // strategy unwind it needs (an underpayment on idle-poor vaults that F1's idle cap
+        // cannot recover). The frozen base is fixed at queue-open and cannot be moved by
+        // the filling transaction, so routing is manipulation-proof while the public view
+        // keeps tracking growth. Anti-DoS (C-1/H-2) is preserved: a genuinely dust batch is
+        // still below the frozen base and still settles from idle without an unwind.
+        uint256 routingThreshold = Math.mulDiv(redeemCycleThresholdBase, MIN_BATCH_COMMIT_BPS, BPS, Math.Rounding.Ceil);
+        if (routingThreshold < MIN_REDEEM_SHARES) routingThreshold = MIN_REDEEM_SHARES;
+        if (outstandingRedeemShares < routingThreshold) {
+            // Full-queue trigger: the strategy is healthy, so pay the batch's full fair
+            // NAV share capped by idle (F1) — never the pari-passu slice, which would
+            // apply a loss haircut that does not exist for a responsive strategy.
+            _settleFromKnownIdle(true);
+            return;
+        }
         activeStrategy.commitWithdrawalCycle();
     }
 
+    /// @notice F6 (Audit 2 delta): self-call trampoline enabling the full-queue trigger to
+    /// attempt the auto-commit under try/catch. Callable only by the contract itself, from
+    /// within the already-`nonReentrant` `requestRedeem`, so it needs no separate guard.
+    function autoCommitOnFullQueue(IVaultBAsyncStrategy activeStrategy) external {
+        if (msg.sender != address(this)) revert OnlySelf();
+        _commitRedeemCycle(activeStrategy, commitThresholdShares());
+    }
+
+    /// @param strategyHealthy true when the strategy is responsive (the full-queue
+    /// commit trigger), false when it is unavailable (`forceSettleStuckCycle` recovery).
+    /// The two cases price the batch differently and MUST NOT share one formula
+    /// (Audit 2 delta F1):
+    ///  - Healthy strategy: there is no unrealizable loss to share, so the batch is
+    ///    paid its full fair NAV share, capped only by physically-available idle —
+    ///    `min(batchShare, available)`. Scaling by the batch's supply fraction here
+    ///    underpays a normal, deployed vault by ~99%.
+    ///  - Unavailable strategy: the deployed value is unrealizable, so the batch shares
+    ///    that loss pari-passu with remaining holders and receives only its
+    ///    supply-proportional slice of realizable idle — `available · committedShares /
+    ///    supply` — matching the conservative B11-T3 recovery intent.
+    function _settleFromKnownIdle(bool strategyHealthy) internal {
+        uint256 batchShare =
+            Math.mulDiv(redeemCycleAssetsSnapshot, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
+        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 available = idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
+        uint256 cap = strategyHealthy
+            ? available
+            : Math.mulDiv(available, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
+        uint256 payout = batchShare < cap ? batchShare : cap;
+        redeemCyclePayoutAssets = payout;
+        redeemCycleSettlementInitialized = true;
+        redeemCycleForceSettled = true;
+        emit RedeemCycleForceSettled(payout, batchShare, available);
+    }
+
     /// @notice B11-T3: recover a committed cycle whose readiness source is broken.
-    /// After REDEEM_CYCLE_TIMEOUT, ANYONE may settle the batch — calling the strategy
-    /// ZERO times, so a strategy that reverts on every call cannot keep the cycle (and
-    /// with it the whole vault, since a committed cycle blocks deposits and the sync
-    /// exit) locked forever. The payout is the batch's fair claim on the FROZEN commit
-    /// snapshot (`assetsSnapshot * committedShares / supplySnapshot`), capped at the
-    /// vault's available idle; any shortfall is borne pro-rata (each claim divides the
-    /// same payout by committed shares). Funds the venue returns AFTER this settlement
-    /// belong to the remaining holders — the payout is fixed here, not topped up.
-    /// Gated on the LOCAL commit flag, which is strategy-free and guarantees the
-    /// snapshot was frozen while the strategy was healthy.
+    /// After REDEEM_CYCLE_TIMEOUT, ANYONE may settle a batch only when the
+    /// strategy's commitment view is unavailable. A responsive strategy — even
+    /// if merely slow — remains on the normal path. The force payout uses only
+    /// known spendable idle, pro-rata to the batch's frozen share of supply, and
+    /// never spends a stale claim on capital whose current value cannot be read.
     function forceSettleStuckCycle() external nonReentrant {
         if (!_redeemCycleCommitted) revert RedeemCycleNotCommitted();
         if (redeemCycleSettlementInitialized) revert RedeemCycleAlreadySettled();
         uint256 readyAt = uint256(redeemCycleCommittedAt) + REDEEM_CYCLE_TIMEOUT;
         if (block.timestamp < readyAt) revert RedeemCycleTimeoutNotElapsed(block.timestamp, readyAt);
 
-        uint256 batchShare =
-            Math.mulDiv(redeemCycleAssetsSnapshot, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
-        uint256 available = idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
-        uint256 payout = batchShare < available ? batchShare : available;
-        redeemCyclePayoutAssets = payout;
-        redeemCycleSettlementInitialized = true;
-        redeemCycleForceSettled = true;
-        emit RedeemCycleForceSettled(payout, batchShare, available);
+        IVaultBAsyncStrategy activeStrategy = strategy;
+        if (address(activeStrategy) == address(0)) revert StrategyUnset();
+        // The force path is a recovery for an unavailable readiness source, not
+        // a caller-selected alternate price for a healthy-but-slow strategy.
+        bool strategyUnavailable;
+        try activeStrategy.withdrawalCycleCommitted() returns (bool) {}
+        catch {
+            strategyUnavailable = true;
+        }
+        if (!strategyUnavailable) revert RedeemCycleStrategyResponsive();
+
+        // Unavailable strategy: pari-passu recovery — the batch shares the
+        // unrealizable deployed loss with remaining holders (F1).
+        _settleFromKnownIdle(false);
     }
 
     /// @notice Freeze the batch basis (supply, NAV, committed shares) used by
@@ -688,6 +798,23 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
                 || (address(activeStrategy) != address(0) && activeStrategy.withdrawalCycleCommitted());
     }
 
+    /// @notice F5 (Audit 2 delta): committed view for owner-exit gates (cancel /
+    /// updateReceiver). Same "combined" semantics as {redeemCycleCommitted}, but a
+    /// strategy that reverts (outage) is treated as NOT committed instead of bubbling
+    /// the revert up — so an owner can still exit an UNCOMMITTED request during an
+    /// adapter/Main outage, while a Main-side auto-commit on a RESPONSIVE strategy still
+    /// locks the batch. Fail-open only for cancel-ability, never for payout.
+    function _redeemCycleCommittedForExit() internal view returns (bool) {
+        if (_redeemCycleCommitted) return true;
+        IVaultBAsyncStrategy activeStrategy = strategy;
+        if (address(activeStrategy) == address(0)) return false;
+        try activeStrategy.withdrawalCycleCommitted() returns (bool committed) {
+            return committed;
+        } catch {
+            return false;
+        }
+    }
+
     /// @notice Slot key for the pending-redeem guard (B11-T4). Aggregation is per
     /// (owner, receiver): the receiver is preserved and the pair owns the slot.
     function _redeemKey(address owner, address receiver) internal pure returns (bytes32) {
@@ -696,9 +823,12 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
 
     function commitThresholdShares() public view returns (uint256 threshold) {
         if (outstandingRedeemCount == 0) return 0;
-        // B10-T1 finding 8: 5% of the supply SNAPSHOT taken at queue-open, not of
-        // live supply the caller can move in the same block.
-        threshold = Math.mulDiv(redeemCycleThresholdBase, MIN_BATCH_COMMIT_BPS, BPS, Math.Rounding.Ceil);
+        // Keep the queue-open snapshot as a floor against same-block dilution,
+        // while tracking later supply growth so old dust cannot lower the bar.
+        uint256 base = redeemCycleThresholdBase;
+        uint256 live = totalSupply();
+        if (live > base) base = live;
+        threshold = Math.mulDiv(base, MIN_BATCH_COMMIT_BPS, BPS, Math.Rounding.Ceil);
         if (threshold < MIN_REDEEM_SHARES) threshold = MIN_REDEEM_SHARES;
     }
 
@@ -711,8 +841,9 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         if (request.status != RedeemStatus.PENDING) revert RedeemRequestUnknown();
         IVaultBAsyncStrategy activeStrategy = strategy;
         if (address(activeStrategy) == address(0)) revert StrategyUnset();
-        // B11-T3: a force-settled cycle pays from the frozen payout + idle, so it must
-        // not gate on (or otherwise touch) the broken readiness source.
+        // B11-T3: a force-settled cycle pays from the frozen payout + idle, so it
+        // bypasses the broken readiness gate. It releases the canonical zero-
+        // asset request below before clearing its local request state.
         if (!redeemCycleForceSettled && !activeStrategy.withdrawalReady(request.strategyRequestId)) {
             revert RedeemNotReady();
         }
@@ -732,7 +863,7 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         } else {
             assets = previewRedeem(shares);
         }
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 idle = _spendableIdle();
         uint256 missing = assets > idle ? assets - idle : 0;
 
         request.status = RedeemStatus.CLAIMED;
@@ -743,14 +874,31 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // `<`, matching _ensureLiquidity: a strategy that returns 1 wei more than
         // requested (lot rounding) must not permanently jam this one claim and,
         // through it, the whole vault. Any surplus stays idle as shareholder value.
-        // B11-T3: skip the strategy pull on a force-settled cycle — the payout was
-        // capped at available idle, so `missing` is 0 and there is nothing to pull.
+        // A force payout is fully covered by known idle, so no user assets are
+        // pulled. Release Main's canonical zero-asset handle directly through
+        // its immutable root-Vault endpoint; this does not rely on the adapter
+        // being callable and keeps the two commitment journals aligned.
         if (!redeemCycleForceSettled) {
             uint256 withdrawn = activeStrategy.claimWithdrawal(request.strategyRequestId, missing);
             if (withdrawn < missing) revert StrategyShortfall(missing, withdrawn);
+        } else {
+            // A sub-economic full queue never commits Main, so release its
+            // zero-asset handle through the normal cancel path.  The timeout
+            // recovery path falls back to Main's force-clear endpoint when the
+            // strategy cancel is unavailable.
+            // F4 (Audit 2 delta): release TOLERANTLY. The payout is fully idle-backed, so
+            // a handle that no tier can release must not brick this claim (and, through
+            // the count-zero gate, freeze the whole vault). An un-releasable handle is
+            // logged for the admin escape hatch to retry once the endpoint recovers; a
+            // handle later honored by Main returns assets to idle as shareholder value,
+            // never a double payout to this already-paid receiver.
+            bool released =
+                VaultBDepositLib.cancelWithdrawalTolerant(strategy, strategyAssetSource, request.strategyRequestId);
+            if (!released) emit RedeemHandleReleaseDeferred(requestId, request.strategyRequestId);
         }
-        if (IERC20(asset()).balanceOf(address(this)) < assets) {
-            revert StrategyShortfall(assets, IERC20(asset()).balanceOf(address(this)));
+        uint256 spendableIdle = _spendableIdle();
+        if (spendableIdle < assets) {
+            revert StrategyShortfall(assets, spendableIdle);
         }
 
         _burn(address(this), shares);
@@ -791,6 +939,14 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         if (request.status != RedeemStatus.PENDING || msg.sender != request.owner) {
             revert RedeemRequestUnknown();
         }
+        // Mutable while freely cancellable; fixed before the committed payout is
+        // observable so the owner cannot redirect a batch claim mid-settlement.
+        // F5 (Audit 2 delta): gate on the combined committed view — a Main-side
+        // auto-commit (strategy.withdrawalCycleCommitted) locks the batch before the
+        // local snapshot is lazily taken, so the raw flag alone would let an owner
+        // move a receiver out of an already-committed batch. Tolerant variant: a
+        // strategy outage does not block the owner from an uncommitted receiver edit.
+        if (_redeemCycleCommittedForExit() || redeemCycleSettlementInitialized) revert RedeemCycleLocked();
         address oldReceiver = request.receiver;
         if (newReceiver == oldReceiver) return;
         // B11-T4: the pending-slot guard is keyed by (owner, receiver), so moving the
@@ -812,7 +968,11 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         RedeemRequest storage request = redeemRequests[requestId];
         if (request.status != RedeemStatus.PENDING) revert RedeemRequestUnknown();
         if (msg.sender != request.owner) revert NotRedeemOwner();
-        if (redeemCycleCommitted()) revert RedeemCycleLocked();
+        // F5 (Audit 2 delta): combined committed view (tolerant of a strategy outage,
+        // so an uncommitted owner can still cancel to recover funds during an outage),
+        // so a Main-side auto-commit cannot be escaped loss-exposure-free before the
+        // local snapshot materializes.
+        if (_redeemCycleCommittedForExit()) revert RedeemCycleLocked();
 
         uint256 shares = request.shares;
         request.status = RedeemStatus.CANCELED;
@@ -821,7 +981,7 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // B11-T4: clearing the (owner, receiver) slot releases the whole accumulated
         // position — `request.shares` already holds every aggregated top-up.
         pendingRedeemKeyPlusOne[_redeemKey(request.owner, request.receiver)] = 0;
-        strategy.cancelWithdrawal(request.strategyRequestId);
+        VaultBDepositLib.cancelWithdrawal(strategy, strategyAssetSource, request.strategyRequestId);
         _transfer(address(this), request.owner, shares);
         if (outstandingRedeemCount == 0) _clearRedeemCycle();
         emit RedeemCanceled(requestId, request.owner, shares);
@@ -890,13 +1050,19 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     }
 
     function _ensureLiquidity(uint256 assetsNeeded) internal {
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 idle = _spendableIdle();
         if (idle >= assetsNeeded) return;
         IVaultBAsyncStrategy activeStrategy = strategy;
         if (address(activeStrategy) == address(0)) revert StrategyUnset();
         uint256 missing = assetsNeeded - idle;
         uint256 withdrawn = activeStrategy.withdrawToVault(missing);
         if (withdrawn < missing) revert StrategyShortfall(missing, withdrawn);
+    }
+
+    function _spendableIdle() internal view returns (uint256) {
+        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 reserved = totalClaimableAssets;
+        return idle > reserved ? idle - reserved : 0;
     }
 
     function _initializeRedeemCycleSettlement(IVaultBAsyncStrategy activeStrategy) internal {
@@ -913,7 +1079,13 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // exit with >2% execution loss reverts every claim forever and freezes the
         // whole vault (and claimableRedeemRequest, which reads the preview, would show
         // a ready amount for a claim that reverts).
-        if (redeemCycleCommittedShares == redeemCycleSupplySnapshot) {
+        // M-01 (Audit 2 integration): use a near-100% BAND, not exact equality. A holder
+        // of sub-redeemable dust (< MIN_REDEEM_SHARES — too small to ever join the queue)
+        // left outside the batch would otherwise, by simply not exiting, keep committed <
+        // supply and force the loss cap on a de-facto full exit, freezing every claim on a
+        // >2% loss. The residual dust is diluted to a negligible amount, exactly as the
+        // exact-100% path treats a zero remainder. Underflow-safe: committed <= supply.
+        if (redeemCycleSupplySnapshot - redeemCycleCommittedShares <= MIN_REDEEM_SHARES) {
             redeemCyclePayoutAssets = totalAssets();
             redeemCycleSettlementInitialized = true;
             emit RedeemCycleSettlementInitialized(redeemCyclePayoutAssets, measured, redeemCycleProtocolCredit, charged);
@@ -953,7 +1125,10 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         if (supply == 0 || batchShares == 0 || batchShares > supply) return (false, 0);
 
         uint256 currentAssets = totalAssets();
-        if (batchShares == supply) return (true, currentAssets);
+        // M-01 (Audit 2 integration): near-100% band, not exact equality — see the
+        // matching guard in _initializeRedeemCycleSettlement. A sub-redeemable dust
+        // remainder cannot be used to withhold the 100% bypass and force the loss cap.
+        if (supply - batchShares <= MIN_REDEEM_SHARES) return (true, currentAssets);
 
         uint256 measured = activeStrategy.withdrawalCycleExecutionLoss();
         uint256 chargeable = activeStrategy.withdrawalCycleChargeableExecutionLoss();
@@ -965,7 +1140,11 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
 
         uint256 basePayout = Math.mulDiv(currentAssets, batchShares, supply);
         uint256 charge = Math.mulDiv(charged, supply - batchShares, supply, Math.Rounding.Ceil);
-        if (charge > basePayout) return (false, 0);
+        // A full queue is deliberately an independent liveness trigger. A small
+        // committed batch can bear at most its pro-rata current-asset claim, so
+        // saturate an excessive additional loss charge at zero payout instead
+        // of making every request unclaimable forever.
+        if (charge >= basePayout) return (true, 0);
         return (true, basePayout - charge);
     }
 
@@ -974,6 +1153,7 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // Release the threshold base so the next queue re-snapshots (B10-T1 #8);
         // it must not stick after the cycle closes.
         redeemCycleThresholdBase = 0;
+        redeemCycleMaxPendingAtOpen = 0;
         redeemCycleSupplySnapshot = 0;
         redeemCycleAssetsSnapshot = 0;
         redeemCycleCommittedShares = 0;
