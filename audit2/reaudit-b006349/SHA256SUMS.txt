@@ -1,0 +1,3 @@
+234dd3bebe08d2f4833f8a3ff6678546bc6f0683ac6fca8f2a86a422ebb14975  DeepYieldVaultB.reaudit.flat.sol
+ee14c9757eba9ff85ccad19b35fbce1e439ff650f4e3bf3717bbba24a8e0f79d  PancakeV3MasterchefVenue.reaudit.flat.sol
+6c3b3c7d477b0a08425842dcb57e028f171502187686d02b8ac29c96a1663bd2  VaultBDepositLib.reaudit.flat.sol

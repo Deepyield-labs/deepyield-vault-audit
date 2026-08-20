@@ -1085,7 +1085,7 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // supply and force the loss cap on a de-facto full exit, freezing every claim on a
         // >2% loss. The residual dust is diluted to a negligible amount, exactly as the
         // exact-100% path treats a zero remainder. Underflow-safe: committed <= supply.
-        if (redeemCycleSupplySnapshot - redeemCycleCommittedShares <= MIN_REDEEM_SHARES) {
+        if (redeemCycleSupplySnapshot - redeemCycleCommittedShares < MIN_REDEEM_SHARES) {
             redeemCyclePayoutAssets = totalAssets();
             redeemCycleSettlementInitialized = true;
             emit RedeemCycleSettlementInitialized(redeemCyclePayoutAssets, measured, redeemCycleProtocolCredit, charged);
@@ -1128,7 +1128,7 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // M-01 (Audit 2 integration): near-100% band, not exact equality — see the
         // matching guard in _initializeRedeemCycleSettlement. A sub-redeemable dust
         // remainder cannot be used to withhold the 100% bypass and force the loss cap.
-        if (supply - batchShares <= MIN_REDEEM_SHARES) return (true, currentAssets);
+        if (supply - batchShares < MIN_REDEEM_SHARES) return (true, currentAssets);
 
         uint256 measured = activeStrategy.withdrawalCycleExecutionLoss();
         uint256 chargeable = activeStrategy.withdrawalCycleChargeableExecutionLoss();
