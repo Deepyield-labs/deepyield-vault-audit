@@ -117,6 +117,10 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     /// may be force-settled from idle by anyone. A normal cycle closes in hours; a week
     /// means it is genuinely broken and avoids forcing a healthy cycle to book a loss.
     uint256 public constant REDEEM_CYCLE_TIMEOUT = 7 days;
+    /// @notice Finding 4 (Audit 2 re-audit): strategy handles a force-settled claim could
+    /// not release (logged via {RedeemHandleReleaseDeferred}), so the admin escape hatch can
+    /// only ever target a genuinely-orphaned handle — never a live PENDING request.
+    mapping(bytes32 => bool) public deferredRedeemHandle;
     address public pendingStrategy;
     address internal _pendingStrategyAssetSource;
     uint64 public pendingStrategyReadyAt;
@@ -143,6 +147,9 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     /// @notice F6 (Audit 2 delta): the auto-commit trampoline is callable only by the
     /// contract itself.
     error OnlySelf();
+    /// @notice Finding 4 (Audit 2 re-audit): the admin escape hatch was given a handle that
+    /// was never logged as an un-releasable deferred handle.
+    error RedeemHandleNotDeferred();
     error RedeemCycleNotCommitted();
     error RedeemCycleAlreadySettled();
     error RedeemCycleTimeoutNotElapsed(uint256 nowTs, uint256 readyAt);
@@ -382,6 +389,10 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     /// it only succeeds once an endpoint can actually clear the handle — the receiver was
     /// already paid from idle, so this only reconciles the canonical journal.
     function releaseDeferredRedeemHandle(bytes32 strategyRequestId) external onlyRole(ADMIN_ROLE) {
+        // Finding 4 (Audit 2 re-audit): only a handle a force-settled claim actually failed
+        // to release is eligible — the admin can never cancel a live PENDING request's handle.
+        if (!deferredRedeemHandle[strategyRequestId]) revert RedeemHandleNotDeferred();
+        delete deferredRedeemHandle[strategyRequestId];
         VaultBDepositLib.cancelWithdrawal(strategy, strategyAssetSource, strategyRequestId);
         emit RedeemHandleReleased(strategyRequestId);
     }
@@ -425,7 +436,8 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
             paused() || redeemCycleCommitted() || pendingStrategy != address(0),
             totalSupply(),
             depositCap,
-            totalClaimableAssets
+            totalClaimableAssets,
+            MIN_DEPOSIT
         );
     }
 
@@ -894,7 +906,10 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
             // never a double payout to this already-paid receiver.
             bool released =
                 VaultBDepositLib.cancelWithdrawalTolerant(strategy, strategyAssetSource, request.strategyRequestId);
-            if (!released) emit RedeemHandleReleaseDeferred(requestId, request.strategyRequestId);
+            if (!released) {
+                deferredRedeemHandle[request.strategyRequestId] = true; // Finding 4
+                emit RedeemHandleReleaseDeferred(requestId, request.strategyRequestId);
+            }
         }
         uint256 spendableIdle = _spendableIdle();
         if (spendableIdle < assets) {
