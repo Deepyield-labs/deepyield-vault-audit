@@ -635,18 +635,17 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         activeStrategy.requestWithdrawal(strategyId, 0);
         emit RedeemRequested(requestId, strategyId, owner, receiver, shares);
 
-        // Reaching the configured queue ceiling is an atomic liveness trigger in
-        // this same transaction. A sub-economic queue is settled from known idle;
-        // an economic queue commits Main. Either way the final request cannot
-        // leave a full, unserviceable queue behind.
-        if (outstandingRedeemCount == redeemCycleMaxPendingAtOpen) {
-            // F6 (Audit 2 delta): best-effort auto-commit. The economic branch makes a
-            // one-way-door strategy.commitWithdrawalCycle() call; a revert there must not
-            // unwind the marginal request's escrow and slot. Attempt it through a self-call
-            // so a failure rolls back only the commit (snapshot included) and leaves the
-            // queue full-but-uncommitted, committable later via the permissionless
-            // commitRedeemCycle() once the strategy recovers. The sub-economic branch makes
-            // no strategy call and so always commits synchronously here.
+        // B (Audit 2): a full queue auto-commits ONLY when the batch is ECONOMIC (>= the frozen
+        // 5% threshold) — it then routes through the strategy for a fair unwind. A full
+        // SUB-economic queue is deliberately left open (no idle-only force-settle, no
+        // dust-forced unwind): its owners cancel or wait until the batch grows economic. This
+        // removes the sub-economic settlement machinery behind the underpayment / recovery
+        // findings. The auto-commit is best-effort (F6): a one-way strategy commit revert must
+        // not unwind the marginal request's escrow/slot, so it runs through a try/catch self-call.
+        if (
+            outstandingRedeemCount == redeemCycleMaxPendingAtOpen
+                && outstandingRedeemShares >= _economicRoutingThreshold()
+        ) {
             try this.autoCommitOnFullQueue(activeStrategy) {}
             catch {
                 emit RedeemCycleAutoCommitDeferred(outstandingRedeemCount);
@@ -674,11 +673,10 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         }
 
         uint256 threshold = commitThresholdShares();
-        // A full queue is a second, independent liveness trigger. Sub-economic
-        // dust is paid only from known idle; otherwise the normal strategy commit
-        // path is used. This keeps final-slot atomicity without a cheap unwind.
-        bool queueFull = outstandingRedeemCount >= redeemCycleMaxPendingAtOpen;
-        if (outstandingRedeemShares < threshold && !queueFull) {
+        // B (Audit 2): only an ECONOMIC batch (>= 5% of live supply) is committable here — the
+        // full-queue bypass that force-settled sub-economic dust from idle is removed. A
+        // sub-economic queue stays open: owners cancel or wait until it grows economic.
+        if (outstandingRedeemShares < threshold) {
             revert RedeemCycleNotReady(outstandingRedeemShares, threshold);
         }
         _commitRedeemCycle(activeStrategy, threshold);
@@ -695,37 +693,19 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         _takeRedeemCycleSnapshot(0);
     }
 
+    /// @notice B (Audit 2): the queue-open frozen economic threshold (5% of the queue-open
+    /// supply, floored at MIN_REDEEM_SHARES). Immune to same-transaction supply pumping.
+    function _economicRoutingThreshold() internal view returns (uint256 t) {
+        t = Math.mulDiv(redeemCycleThresholdBase, MIN_BATCH_COMMIT_BPS, BPS, Math.Rounding.Ceil);
+        if (t < MIN_REDEEM_SHARES) t = MIN_REDEEM_SHARES;
+    }
+
+    /// @dev B (Audit 2): only ever reached for an ECONOMIC batch (>= the frozen threshold), so it
+    /// simply snapshots and routes through the strategy for a fair unwind. The old sub-economic
+    /// idle-only settlement (and its dust-forced-unwind / underpayment / recovery Highs) is gone:
+    /// a sub-economic full queue is never committed here — its owners cancel or wait for growth.
     function _commitRedeemCycle(IVaultBAsyncStrategy activeStrategy, uint256 threshold) internal {
         _takeRedeemCycleSnapshot(threshold);
-        // F2 (Audit 2 delta): route economic-vs-sub-economic on the QUEUE-OPEN frozen
-        // base, not the growth-tracked live threshold. `commitThresholdShares()` mixes in
-        // live `totalSupply()` (deliberately, for B10-F8's readiness gate), which a same-
-        // transaction deposit can inflate — pumping the live threshold above an honest,
-        // genuinely-large batch to misroute it into the idle-only settlement and skip the
-        // strategy unwind it needs (an underpayment on idle-poor vaults that F1's idle cap
-        // cannot recover). The frozen base is fixed at queue-open and cannot be moved by
-        // the filling transaction, so routing is manipulation-proof while the public view
-        // keeps tracking growth. Anti-DoS (C-1/H-2) is preserved: a genuinely dust batch is
-        // still below the frozen base and still settles from idle without an unwind.
-        uint256 routingThreshold = Math.mulDiv(redeemCycleThresholdBase, MIN_BATCH_COMMIT_BPS, BPS, Math.Rounding.Ceil);
-        if (routingThreshold < MIN_REDEEM_SHARES) routingThreshold = MIN_REDEEM_SHARES;
-        if (outstandingRedeemShares < routingThreshold) {
-            // Finding 1 (Audit 2 re-audit): settle a sub-economic full queue from idle ONLY when
-            // idle fully covers the batch's fair NAV share. Otherwise the batch holds real value
-            // the thin idle cannot pay — an honest redeemer the attacker's dust merely pushed over
-            // the count trigger — so route it through the strategy unwind rather than sealing an
-            // underpayment (which was permanent: fundRedeemCycleDeficit is settlement-gated). Pure
-            // dust keeps batchShare <= available and still settles from idle (the C-1/H-2 anti-DoS
-            // holds for a well-funded idle); only a real-value batch idle cannot cover unwinds.
-            uint256 batchShare =
-                Math.mulDiv(redeemCycleAssetsSnapshot, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
-            uint256 idleNow = IERC20(asset()).balanceOf(address(this));
-            uint256 availableNow = idleNow > totalClaimableAssets ? idleNow - totalClaimableAssets : 0;
-            if (availableNow >= batchShare) {
-                _settleFromKnownIdle(true);
-                return;
-            }
-        }
         activeStrategy.commitWithdrawalCycle();
     }
 
@@ -737,26 +717,16 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         _commitRedeemCycle(activeStrategy, commitThresholdShares());
     }
 
-    /// @param strategyHealthy true when the strategy is responsive (the full-queue
-    /// commit trigger), false when it is unavailable (`forceSettleStuckCycle` recovery).
-    /// The two cases price the batch differently and MUST NOT share one formula
-    /// (Audit 2 delta F1):
-    ///  - Healthy strategy: there is no unrealizable loss to share, so the batch is
-    ///    paid its full fair NAV share, capped only by physically-available idle —
-    ///    `min(batchShare, available)`. Scaling by the batch's supply fraction here
-    ///    underpays a normal, deployed vault by ~99%.
-    ///  - Unavailable strategy: the deployed value is unrealizable, so the batch shares
-    ///    that loss pari-passu with remaining holders and receives only its
-    ///    supply-proportional slice of realizable idle — `available · committedShares /
-    ///    supply` — matching the conservative B11-T3 recovery intent.
-    function _settleFromKnownIdle(bool strategyHealthy) internal {
+    /// @dev B (Audit 2): pari-passu recovery from known idle for the timeout force-settle path
+    /// only. The batch shares the unrealizable deployed value with remaining holders (its idle
+    /// slice, capped by its fair NAV share). The old healthy sub-economic idle-only settlement is
+    /// removed, so this is no longer reachable from the commit path.
+    function _settleFromKnownIdle() internal {
         uint256 batchShare =
             Math.mulDiv(redeemCycleAssetsSnapshot, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
         uint256 idle = IERC20(asset()).balanceOf(address(this));
         uint256 available = idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
-        uint256 cap = strategyHealthy
-            ? available
-            : Math.mulDiv(available, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
+        uint256 cap = Math.mulDiv(available, redeemCycleCommittedShares, redeemCycleSupplySnapshot);
         uint256 payout = batchShare < cap ? batchShare : cap;
         redeemCyclePayoutAssets = payout;
         redeemCycleSettlementInitialized = true;
@@ -783,7 +753,7 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // claim in `_initializeRedeemCycleSettlement`. The pari-passu payout already bounds the
         // downside for a slow-but-responsive strategy, and the gameable OOG/transient-revert probe
         // is gone. Recovery pays pari-passu from known idle, sharing unrealizable value.
-        _settleFromKnownIdle(false);
+        _settleFromKnownIdle();
     }
 
     /// @notice Freeze the batch basis (supply, NAV, committed shares) used by
@@ -1099,15 +1069,16 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // exit with >2% execution loss reverts every claim forever and freezes the
         // whole vault (and claimableRedeemRequest, which reads the preview, would show
         // a ready amount for a claim that reverts).
-        // M-01 + Finding 4 (Audit 2): near-100% band gated on the residual's ASSET VALUE, not a
-        // share count. A holder left outside the batch whose remaining value is below one minimum
-        // deposit cannot, by not exiting, force the loss cap on a de-facto full exit (freezing
-        // every claim on a >2% loss). Value-based (not `< MIN_REDEEM_SHARES`) so a growing
-        // price-per-share cannot let the band confiscate ever-larger real value. Underflow-safe:
+        // M-01 + Findings 4 & F-2 (Audit 2): near-100% band gated on the residual holders' ASSET
+        // VALUE, not a share count, and evaluated off the SAME live NAV the bypass then pays out
+        // (`totalAssets()`), never the frozen snapshot. Using the snapshot would let a strategy
+        // under-reporting at commit then correctly reporting by first claim trip the band on a
+        // low snapshot and hand the batch the full live NAV, zeroing residual holders. Value-based
+        // so a growing price-per-share cannot confiscate ever-larger real value. Underflow-safe:
         // committed <= supply. A zero remainder (true 100% exit) trivially satisfies it.
         if (
             Math.mulDiv(
-                redeemCycleAssetsSnapshot,
+                totalAssets(),
                 redeemCycleSupplySnapshot - redeemCycleCommittedShares,
                 redeemCycleSupplySnapshot
             ) < MIN_DEPOSIT
@@ -1151,10 +1122,11 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         if (supply == 0 || batchShares == 0 || batchShares > supply) return (false, 0);
 
         uint256 currentAssets = totalAssets();
-        // M-01 + Finding 4 (Audit 2): value-based near-100% band — see the matching guard in
-        // _initializeRedeemCycleSettlement. Bypass when the residual holders' ASSET VALUE is
-        // below one minimum deposit, so a growing price-per-share cannot confiscate real value.
-        if (Math.mulDiv(assetsSnapshot, supply - batchShares, supply) < MIN_DEPOSIT) return (true, currentAssets);
+        // M-01 + Findings 4 & F-2 (Audit 2): value-based near-100% band, evaluated off the SAME
+        // live `currentAssets` the bypass pays out (not the frozen snapshot) — see the matching
+        // guard in _initializeRedeemCycleSettlement. Bypass when the residual holders' asset value
+        // is below one minimum deposit, so a growing PPS cannot confiscate real value.
+        if (Math.mulDiv(currentAssets, supply - batchShares, supply) < MIN_DEPOSIT) return (true, currentAssets);
 
         uint256 measured = activeStrategy.withdrawalCycleExecutionLoss();
         uint256 chargeable = activeStrategy.withdrawalCycleChargeableExecutionLoss();
