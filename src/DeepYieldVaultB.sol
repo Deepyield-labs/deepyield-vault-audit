@@ -971,7 +971,17 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
         // B11-T4: clearing the (owner, receiver) slot releases the whole accumulated
         // position — `request.shares` already holds every aggregated top-up.
         pendingRedeemKeyPlusOne[_redeemKey(request.owner, request.receiver)] = 0;
-        VaultBDepositLib.cancelWithdrawal(strategy, strategyAssetSource, request.strategyRequestId);
+        // H-4 (Audit 2 re-audit): release the canonical handle TOLERANTLY so a strategy/Main
+        // outage cannot hard-revert the cancel — otherwise the "owners cancel to recover an
+        // uncommitted queue" liveness (the B design) fails exactly when it is needed. The
+        // per-request handle is a zero-asset withdrawal registration, so a dangling one is
+        // harmless (a later honor returns 0 assets); it is logged for the admin escape hatch.
+        bool released =
+            VaultBDepositLib.cancelWithdrawalTolerant(strategy, strategyAssetSource, request.strategyRequestId);
+        if (!released) {
+            deferredRedeemHandle[request.strategyRequestId] = true;
+            emit RedeemHandleReleaseDeferred(requestId, request.strategyRequestId);
+        }
         _transfer(address(this), request.owner, shares);
         if (outstandingRedeemCount == 0) _clearRedeemCycle();
         emit RedeemCanceled(requestId, request.owner, shares);
@@ -1024,7 +1034,14 @@ contract DeepYieldVaultB is ERC4626, AccessControlDefaultAdminRules, Pausable, R
     /// not authorize a wider loss budget.
     function fundRedeemCycleDeficit(uint256 assets) external nonReentrant {
         if (msg.sender != treasury) revert NotTreasury();
-        if (!redeemCycleCommitted() || redeemCycleSettlementInitialized) revert RedeemCycleLocked();
+        // C-2 (Audit 2 re-audit): allow the trusted treasury to fund even AFTER settlement is
+        // initialized. This is the recovery backstop for a stuck cycle: if a committed batch's
+        // claim can no longer draw its owed assets from the strategy (a byzantine under-delivery),
+        // a single stuck claim would otherwise set `redeemCycleSettlementInitialized` and freeze
+        // every user (deposit/mint/withdraw/redeem/claim). Post-settlement funding tops up idle so
+        // the stuck claim's `missing` is covered and the cycle drains. Pre-settlement, the credit
+        // still feeds the loss cap; post-settlement it is unused and reset on clear (harmless).
+        if (!redeemCycleCommitted()) revert RedeemCycleLocked();
         if (assets == 0) revert ZeroAmount();
         // Treasury may fund before the first claim even when Main auto-committed;
         // materialize the snapshot first so the credit sits on a coherent batch
