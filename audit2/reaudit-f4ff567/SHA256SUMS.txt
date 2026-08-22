@@ -1,0 +1,3 @@
+689c79d94c3191374e698edf40feb1ffa0c1844941c01bf9767ecb973d634aa3  flat/DedicatedVaultStrategyAdapterV2.reaudit.flat.sol
+2b965337391756dfd15e5aa8d7a846ced7240ae03ad92b6f75664e842b03010f  flat/DeepYieldVaultB.reaudit.flat.sol
+405c1bf25b3b93f0768951d7f4dc6a98d498e9fe252216de376bd8d14feb8cb9  flat/VaultBDepositLib.reaudit.flat.sol
